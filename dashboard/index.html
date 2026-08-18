@@ -399,7 +399,7 @@
       <button id="record" class="btn-record">● Record</button>
       <button id="stop" class="secondary" disabled>■ Stop</button>
       <button id="play" class="secondary" disabled>▶ Play Audio</button>
-      <button id="save" class="secondary">💾 Export CSV</button>
+      <button id="save" class="secondary">💾 Export HDF5</button>
       <button id="clear" class="secondary">🗑️ Clear</button>
       <div id="recCounter" class="rec-counter">● <span id="recCounterText">0s (0 rows)</span></div>
     </div>
@@ -552,6 +552,25 @@
         }
         return pcmSamples;
       }
+
+      // Matches firmware encodeBlockSelfContained: 4-byte header (int16 first sample LE,
+      // step index, reserved) seeds the predictor so blocks decode with no boundary click.
+      decodeBlockSelfContained(adpcmBytes) {
+        if (adpcmBytes.length < 4) return new Int16Array(0);
+        let first = adpcmBytes[0] | (adpcmBytes[1] << 8);
+        if (first & 0x8000) first -= 0x10000;
+        this.predictedSample = first;
+        this.stepIndex = Math.max(0, Math.min(88, adpcmBytes[2]));
+        const pcmSamples = new Int16Array(1 + (adpcmBytes.length - 4) * 2);
+        let outIdx = 0;
+        pcmSamples[outIdx++] = first;
+        for (let i = 4; i < adpcmBytes.length; i++) {
+          const byte = adpcmBytes[i];
+          pcmSamples[outIdx++] = this.decodeNibble(byte & 0x0F);
+          pcmSamples[outIdx++] = this.decodeNibble((byte >> 4) & 0x0F);
+        }
+        return pcmSamples;
+      }
     }
 
     const adpcmDecoder = new ImaAdpcmDecoder();
@@ -562,7 +581,10 @@
     const encoder = new TextEncoder(), buffers = { usb: '', ble: '' };
     let serialWriter, commandCharacteristic, bleDevice, activeTransport, rows = [], reconnectTimer;
     let recording = false, audioChunks = [], recordedAudioRate = 8000, playbackSource;
-    let recStartTime = 0;
+    let recStartTime = 0, recEndTime = 0;
+    // Rolling PCM buffer for the live waveform (amplitude vs time), normalized to -1..1.
+    const WAVE_MAX_SAMPLES = 8000;
+    let waveSamples = [];
 
     const histories = { accel: [], gyro: [], audio: [] };
     const statusEl = document.querySelector('#status');
@@ -644,7 +666,9 @@
         const line = buffers[transport].slice(0, newline).trim();
         buffers[transport] = buffers[transport].slice(newline + 1);
         if (!line) continue;
-        try { process(JSON.parse(line)); } catch (_) { setStatus(`Ignored malformed ${transport.toUpperCase()} packet`); }
+        // A dropped BLE fragment corrupts a single newline-delimited line; skip it
+        // quietly (the next frame is intact) instead of leaving a sticky error status.
+        try { process(JSON.parse(line)); } catch (_) { console.debug('skipped malformed frame', transport); }
       }
     }
 
@@ -684,29 +708,40 @@
       }
 
       const audioDbfs = Number(data.audio_dbfs);
+      // Decode the audio payload for every packet so the live waveform works even
+      // before recording starts; also queue chunks for playback while recording.
+      let pcmChunk = null;
+      if (data.audio_pcm_s16_b64) {
+        const binary = atob(data.audio_pcm_s16_b64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        pcmChunk = new Int16Array(bytes.buffer);
+        recordedAudioRate = Number(data.audio_rate_hz) || 16000;
+      } else if (data.audio_adpcm_b64) {
+        const binary = atob(data.audio_adpcm_b64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        // Each packet is a self-contained IMA-ADPCM block whose 4-byte header seeds the
+        // predictor, so it decodes correctly on its own and stays tolerant of drops.
+        pcmChunk = adpcmDecoder.decodeBlockSelfContained(bytes);
+        recordedAudioRate = Number(data.audio_rate_hz) || 8000;
+      } else if (data.audio_pcm_s8_b64) {
+        const binary = atob(data.audio_pcm_s8_b64);
+        pcmChunk = new Int16Array(binary.length);
+        for (let i = 0; i < binary.length; i++) pcmChunk[i] = (binary.charCodeAt(i) << 8);
+        recordedAudioRate = Number(data.audio_rate_hz) || 8000;
+      }
+
+      if (pcmChunk && pcmChunk.length) {
+        for (let i = 0; i < pcmChunk.length; i++) waveSamples.push(pcmChunk[i] / 32768);
+        if (waveSamples.length > WAVE_MAX_SAMPLES) {
+          waveSamples.splice(0, waveSamples.length - WAVE_MAX_SAMPLES);
+        }
+      }
+
       if (recording) {
         rows.push({ time_ms: data.audio_time_ms ?? data.time_ms, type: 'audio', audio_samples: data.audio_samples, audio_dbfs: audioDbfs });
-        if (data.audio_pcm_s16_b64) {
-          const binary = atob(data.audio_pcm_s16_b64);
-          const bytes = new Uint8Array(binary.length);
-          for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-          const chunk = new Int16Array(bytes.buffer);
-          audioChunks.push(chunk);
-          recordedAudioRate = Number(data.audio_rate_hz) || 16000;
-        } else if (data.audio_adpcm_b64) {
-          const binary = atob(data.audio_adpcm_b64);
-          const bytes = new Uint8Array(binary.length);
-          for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-          const chunk = adpcmDecoder.decodeBlock(bytes);
-          audioChunks.push(chunk);
-          recordedAudioRate = Number(data.audio_rate_hz) || 8000;
-        } else if (data.audio_pcm_s8_b64) {
-          const binary = atob(data.audio_pcm_s8_b64);
-          const chunk = new Int16Array(binary.length);
-          for (let i = 0; i < binary.length; i++) chunk[i] = (binary.charCodeAt(i) << 8);
-          audioChunks.push(chunk);
-          recordedAudioRate = Number(data.audio_rate_hz) || 8000;
-        }
+        if (pcmChunk && pcmChunk.length) audioChunks.push(pcmChunk);
         updateRecordingCounter();
       }
 
@@ -820,15 +855,26 @@
       ctx.stroke();
 
       if (key === 'audio') {
+        // Real waveform: amplitude vs time, drawn as a min/max envelope per column.
+        if (!waveSamples.length) return;
+        const mid = h / 2, amp = h * 0.45;
+        const cols = Math.max(1, Math.floor(w));
+        const per = waveSamples.length / cols;
         ctx.strokeStyle = '#38bdf8';
-        ctx.lineWidth = 2 * devicePixelRatio;
+        ctx.lineWidth = 1 * devicePixelRatio;
         ctx.beginPath();
-        values.forEach((row, i) => {
-          const x = i * w / Math.max(1, values.length - 1);
-          const db = Math.max(-120, Math.min(0, row[0]));
-          const y = (-db / 120) * (h - 16 * devicePixelRatio) + 8 * devicePixelRatio;
-          i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
-        });
+        for (let c = 0; c < cols; c++) {
+          const start = Math.floor(c * per);
+          const end = Math.max(start + 1, Math.floor((c + 1) * per));
+          let mn = 1, mx = -1;
+          for (let i = start; i < end && i < waveSamples.length; i++) {
+            const v = waveSamples[i];
+            if (v < mn) mn = v;
+            if (v > mx) mx = v;
+          }
+          ctx.moveTo(c, mid - mx * amp);
+          ctx.lineTo(c, mid - mn * amp);
+        }
         ctx.stroke();
         return;
       }
@@ -923,11 +969,14 @@
       try {
         await disconnectActiveTransport();
         const port = await navigator.serial.requestPort();
-        await port.open({ baudRate: 115200 });
+        await port.open({ baudRate: 230400 });
         serialPort = port;
         serialWriter = port.writable.getWriter();
         activeTransport = 'usb';
         buffers.usb = '';
+        // Device streams audio continuously; reset the decoder so the ADPCM stream
+        // stays in sync with the device's fresh encoder state on this connection.
+        adpcmDecoder.reset(); waveSamples = [];
         showTransientStatus('⚡ Connected via USB Serial (Wired)', 3500);
         readUsb(port);
       } catch (e) { setStatus('USB: ' + e.message); }
@@ -942,6 +991,9 @@
       data.addEventListener('characteristicvaluechanged', e => receive(new TextDecoder().decode(e.target.value), 'ble'));
       activeTransport = 'ble';
       buffers.ble = '';
+      // Device resets its ADPCM encoder on connect; match it here so the continuous
+      // stream decodes cleanly.
+      adpcmDecoder.reset(); waveSamples = [];
       showTransientStatus('📡 Connected via Bluetooth LE (Wireless)', 3500);
     }
 
@@ -989,22 +1041,23 @@
       throw new Error('Connect USB or Bluetooth first');
     }
 
-    async function startRecording() {
+    function startRecording() {
       if (!activeTransport) { setStatus('Connect USB or Bluetooth before recording'); return; }
-      try {
-        await sendCommand({ cmd: 'start_audio' });
-        rows = []; audioChunks = []; recording = true; recStartTime = Date.now();
-        document.querySelector('#record').disabled = true;
-        document.querySelector('#stop').disabled = false;
-        document.querySelector('#play').disabled = true;
-        document.querySelector('#recCounter').style.display = 'inline-flex';
-        setStatus('Recording sensor telemetry and PCM audio…', 'connected');
-      } catch (error) { setStatus('Could not start recording: ' + error.message); }
+      // Recording is an independent client-side window: the device streams audio
+      // continuously (so the waveform is always live), and we capture the decoded
+      // PCM between recording start and stop. The codec state is NOT reset here so
+      // the continuous stream stays in sync.
+      rows = []; audioChunks = []; recording = true;
+      recStartTime = Date.now(); recEndTime = 0;
+      document.querySelector('#record').disabled = true;
+      document.querySelector('#stop').disabled = false;
+      document.querySelector('#play').disabled = true;
+      document.querySelector('#recCounter').style.display = 'inline-flex';
+      setStatus('Recording sensor telemetry and PCM audio…', 'connected');
     }
 
-    async function stopRecording() {
-      try { await sendCommand({ cmd: 'stop_audio' }); } catch (error) { setStatus('Audio stop command failed: ' + error.message); }
-      recording = false;
+    function stopRecording() {
+      recording = false; recEndTime = Date.now();
       document.querySelector('#record').disabled = false;
       document.querySelector('#stop').disabled = true;
       document.querySelector('#play').disabled = !audioChunks.length;
@@ -1048,7 +1101,7 @@
     };
 
     document.querySelector('#clear').onclick = () => {
-      recording = false; rows = []; audioChunks = []; adpcmDecoder.reset();
+      recording = false; rows = []; audioChunks = []; adpcmDecoder.reset(); waveSamples = [];
       document.querySelector('#record').disabled = false;
       document.querySelector('#stop').disabled = true;
       document.querySelector('#play').disabled = true;
@@ -1058,16 +1111,90 @@
       setStatus('Recorded data cleared');
     };
 
-    document.querySelector('#save').onclick = () => {
-      if (!rows.length) { setStatus('No recorded data to export'); return; }
-      const csvRows = rows.map(({ time_ms, ...values }) => ({ date_time: new Date(Number(time_ms)).toISOString(), ...values }));
-      const keys = [...new Set(csvRows.flatMap(Object.keys))];
-      const escape = value => `"${String(value ?? '').replaceAll('"', '""')}"`;
-      const csv = [keys.join(','), ...csvRows.map(r => keys.map(k => escape(r[k])).join(','))].join('\n');
-      const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
-      const a = Object.assign(document.createElement('a'), { href: url, download: `pal-v2-pro-${new Date().toISOString().replace(/[:.]/g, '-')}.csv` });
-      a.click();
-      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    document.querySelector('#save').onclick = async () => {
+      if (!rows.length && !audioChunks.length) { setStatus('No recorded data to export'); return; }
+      setStatus('Building HDF5 file…', 'connected');
+      let file = null;
+      try {
+        const mod = await import('https://cdn.jsdelivr.net/npm/h5wasm@0.10.3/dist/esm/hdf5_hl.js');
+        const h5 = mod.default || mod;
+        const Module = await h5.ready;   // FS is only available on the resolved module
+        const FS = Module.FS;
+        const path = 'export.h5';
+        try { FS.unlink(path); } catch (_) {}
+        file = new h5.File(path, 'w');
+
+        // Datatypes are inferred from the TypedArray (Float64Array->f64, Float32Array->f32,
+        // Int16Array->i16). We deliberately avoid dtype strings like '<f8' because h5wasm
+        // sizes them by the letter only and ignores the digits (so '<f8' would become f32
+        // and lose millisecond precision on timestamps).
+
+        // IMU: time_ms (float64) + Nx6 float32 [ax,ay,az,gx,gy,gz]
+        const imu = rows.filter(r => r.type === 'imu');
+        if (imu.length) {
+          const g = file.create_group('imu');
+          const t = new Float64Array(imu.length);
+          const d = new Float32Array(imu.length * 6);
+          imu.forEach((r, i) => {
+            t[i] = Number(r.time_ms);
+            d[i * 6 + 0] = r.ax; d[i * 6 + 1] = r.ay; d[i * 6 + 2] = r.az;
+            d[i * 6 + 3] = r.gx; d[i * 6 + 4] = r.gy; d[i * 6 + 5] = r.gz;
+          });
+          g.create_dataset({ name: 'time_ms', data: t });
+          const ds = g.create_dataset({ name: 'data', data: d, shape: [imu.length, 6] });
+          ds.create_attribute('columns', ['ax', 'ay', 'az', 'gx', 'gy', 'gz']);
+        }
+
+        // Environment: time_ms (float64) + one float32 dataset per field
+        const env = rows.filter(r => r.type === 'environment');
+        if (env.length) {
+          const g = file.create_group('environment');
+          const t = new Float64Array(env.length);
+          env.forEach((r, i) => t[i] = Number(r.time_ms));
+          g.create_dataset({ name: 'time_ms', data: t });
+          const fields = ['temperature_c', 'humidity_pct', 'pressure_hpa', 'gas_ohms', 'iaq', 'voc_ppm', 'eco2_ppm', 'battery_v', 'battery_pct'];
+          for (const key of fields) {
+            const arr = new Float32Array(env.length);
+            env.forEach((r, i) => arr[i] = Number(r[key] ?? NaN));
+            g.create_dataset({ name: key, data: arr });
+          }
+        }
+
+        // Audio: raw PCM int16 with sample-rate attribute, plus per-frame dBFS
+        const audioGroup = file.create_group('audio');
+        const totalPcm = audioChunks.reduce((s, c) => s + c.length, 0);
+        if (totalPcm) {
+          const pcm = new Int16Array(totalPcm);
+          let off = 0;
+          for (const c of audioChunks) { pcm.set(c, off); off += c.length; }
+          const ds = audioGroup.create_dataset({ name: 'pcm_s16', data: pcm });
+          ds.create_attribute('sample_rate_hz', new Int32Array([recordedAudioRate]));
+        }
+        const audioMeta = rows.filter(r => r.type === 'audio');
+        if (audioMeta.length) {
+          const t = new Float64Array(audioMeta.length);
+          const db = new Float32Array(audioMeta.length);
+          audioMeta.forEach((r, i) => { t[i] = Number(r.time_ms); db[i] = Number(r.audio_dbfs ?? NaN); });
+          audioGroup.create_dataset({ name: 'frame_time_ms', data: t });
+          audioGroup.create_dataset({ name: 'frame_dbfs', data: db });
+        }
+
+        file.create_attribute('recorded_start_iso', new Date(recStartTime || Date.now()).toISOString());
+        file.create_attribute('recorded_end_iso', new Date(recEndTime || Date.now()).toISOString());
+
+        file.flush();
+        file.close();
+        file = null;
+        const bytes = FS.readFile(path);
+        const url = URL.createObjectURL(new Blob([bytes], { type: 'application/x-hdf5' }));
+        const a = Object.assign(document.createElement('a'), { href: url, download: `pal-v2-pro-${new Date().toISOString().replace(/[:.]/g, '-')}.h5` });
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+        setStatus('HDF5 file exported', 'connected');
+      } catch (err) {
+        try { if (file) file.close(); } catch (_) {}
+        setStatus('HDF5 export failed: ' + err.message);
+      }
     };
 
     if (!window.isSecureContext) setStatus('Serve this dashboard from localhost or HTTPS to connect');

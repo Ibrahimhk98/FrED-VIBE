@@ -31,8 +31,8 @@ constexpr uint32_t AUDIO_PLAYBACK_RATE_BLE = 8000;
 constexpr uint32_t IMU_INTERVAL_MS = 10;       // 100 Hz sensor acquisition
 constexpr uint32_t PACKET_INTERVAL_MS = 100;   // ten samples per telemetry packet
 constexpr uint32_t ENV_INTERVAL_MS = 1000;
-constexpr size_t AUDIO_PCM16_BUFFER_SIZE = MIC_SAMPLE_RATE * PACKET_INTERVAL_MS / 1000; // 1600 samples
-constexpr size_t BLE_MAX_CHUNK_BYTES = 180;
+constexpr size_t AUDIO_PCM16_BUFFER_SIZE = (MIC_SAMPLE_RATE * PACKET_INTERVAL_MS / 1000) * 5 / 4; // 2000 samples (1600 nominal + jitter headroom so no samples are dropped)
+constexpr size_t BLE_MAX_CHUNK_BYTES = 244;   // matches negotiated MTU 247 (MTU - 3) to minimise notifies per packet
 
 static const char *DEVICE_NAME = "PAL-V2-Telemetry";
 static const char *SERVICE_UUID = "7f510001-5b8d-4a84-9c7c-a07142ab6001";
@@ -71,7 +71,7 @@ uint32_t lastLedUpdateMs = 0;
 volatile uint32_t lastBleActivityMs = 0;
 uint32_t bmeReadyAtMs = 0;
 bool bmeReading = false;
-bool audioStreaming = false;
+bool audioStreaming = true;
 double audioSquareSum = 0.0;
 uint32_t audioSampleCount = 0;
 int16_t audioPcm16Samples[AUDIO_PCM16_BUFFER_SIZE];
@@ -210,8 +210,8 @@ void performSafeBleDisconnect() {
   bleSubscribed = false;
   {
     AudioLock lock;
-    audioStreaming = false;
-    audioPcm16Count = 0;
+    // Keep audioStreaming on (USB waveform stays live); only reset the BLE codec
+    // state so the next connection starts the ADPCM stream cleanly.
     bleAdpcmEncoder.reset();
   }
   const uint16_t handle = bleConnectionHandle;
@@ -314,30 +314,31 @@ void sendLine(const String &line) {
 
   const size_t chunkBytes = bleChunkBytes;
   const uint16_t connectionHandle = bleConnectionHandle;
-  bool notifySuccess = true;
+
+  // Retry each notify briefly: a false return is controller tx congestion, not a lost
+  // link, and yielding lets the buffers drain over a connection interval or two.
+  auto notifyWithRetry = [&](const uint8_t *data, size_t length) -> bool {
+    for (int attempt = 0; attempt < 12; ++attempt) {
+      if (dataCharacteristic->notify(data, length, connectionHandle)) {
+        lastBleActivityMs = millis();
+        return true;
+      }
+      vTaskDelay(1);
+    }
+    return false;
+  };
 
   for (size_t start = 0; start < line.length(); start += chunkBytes) {
     const size_t length = min(chunkBytes, line.length() - start);
-    if (dataCharacteristic->notify(reinterpret_cast<const uint8_t *>(line.c_str() + start), length, connectionHandle)) {
-      lastBleActivityMs = millis();
-    } else {
-      notifySuccess = false;
+    if (!notifyWithRetry(reinterpret_cast<const uint8_t *>(line.c_str() + start), length)) {
       break;
     }
   }
 
-  if (notifySuccess) {
-    const uint8_t newline = '\n';
-    if (dataCharacteristic->notify(&newline, 1, connectionHandle)) {
-      lastBleActivityMs = millis();
-    } else {
-      notifySuccess = false;
-    }
-  }
-
-  if (!notifySuccess) {
-    performSafeBleDisconnect();
-  }
+  // Always emit the newline delimiter (even after a dropped chunk) so a lost fragment
+  // corrupts only its own line and never merges into the following packet.
+  const uint8_t newline = '\n';
+  notifyWithRetry(&newline, 1);
 }
 
 void enqueueTelemetry(const String &line) {
@@ -391,20 +392,18 @@ void handleCommand(String command) {
     {
       AudioLock lock;
       audioStreaming = true;
-      audioPcm16Count = 0;
-      bleAdpcmEncoder.reset();
     }
-    sendStatus("recording", "PCM audio stream started");
+    sendStatus("recording", "PCM audio stream active");
     return;
   }
   if (command.indexOf("stop_audio") >= 0) {
     {
       AudioLock lock;
-      audioStreaming = false;
-      audioPcm16Count = 0;
-      bleAdpcmEncoder.reset();
+      // Streaming stays on so the live waveform never blanks; recording windows are
+      // handled client-side by buffering the decoded PCM.
+      audioStreaming = true;
     }
-    sendStatus("recording_stopped", "PCM audio stream stopped");
+    sendStatus("recording_stopped", "PCM audio stream stays active for live waveform");
     return;
   }
   if (command.indexOf("set_time") < 0) {
@@ -459,9 +458,19 @@ class DataCallbacks : public NimBLECharacteristicCallbacks {
 };
 
 class ServerCallbacks : public NimBLEServerCallbacks {
-  void onConnect(NimBLEServer * /*server*/, NimBLEConnInfo &connInfo) override {
+  void onConnect(NimBLEServer *pServer, NimBLEConnInfo &connInfo) override {
     lastBleActivityMs = millis();
     bleConnectionHandle = connInfo.getConnHandle();
+    // Request a fast connection interval (7.5-15 ms) so audio+IMU telemetry streams
+    // without the queue backing up; latency 0, 2 s supervision timeout.
+    pServer->updateConnParams(connInfo.getConnHandle(), 6, 12, 0, 200);
+    {
+      AudioLock lock;
+      // Start this connection's ADPCM stream from a known state; the dashboard
+      // resets its decoder on connect to match.
+      audioPcm16Count = 0;
+      bleAdpcmEncoder.reset();
+    }
   }
   void onDisconnect(NimBLEServer * /*server*/, NimBLEConnInfo & /*connInfo*/, int /*reason*/) override {
     performSafeBleDisconnect();
@@ -504,8 +513,9 @@ void beginMicrophone() {
   config.communication_format = static_cast<i2s_comm_format_t>(I2S_COMM_FORMAT_STAND_I2S);
   config.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
   config.dma_buf_count = 8;
-  config.dma_buf_len = 128;
-  config.use_apll = false;
+  config.dma_buf_len = 256; // ~128 ms of buffering so packet-send stalls don't overflow
+  config.use_apll = true;   // APLL gives an accurate 16 kHz sample clock so recorded
+                            // audio duration matches playback (avoids ~4% drift)
 
   i2s_pin_config_t pins = {};
   pins.bck_io_num = MIC_BCLK;
@@ -523,41 +533,52 @@ void beginMicrophone() {
 
 void readMicrophone() {
   if (!micReady) return;
-  int32_t frames[128];
-  size_t bytesRead = 0;
-  if (i2s_read(microphonePort, frames, sizeof(frames), &bytesRead, 0) != ESP_OK) return;
-  const size_t words = bytesRead / sizeof(int32_t);
-  if (words == 0) return;
 
-  double sumSq = 0.0;
-  uint32_t count = 0;
-  int16_t pcmBuf[64];
-  size_t pcmCount = 0;
+  // Drain the I2S DMA fully each cycle. A single bounded read cannot keep pace with
+  // the 16 kHz stream and drops samples, which time/pitch-shifts recorded audio.
+  for (;;) {
+    int32_t frames[256]; // 128 stereo frames per read
+    size_t bytesRead = 0;
+    if (i2s_read(microphonePort, frames, sizeof(frames), &bytesRead, 0) != ESP_OK) return;
+    const size_t words = bytesRead / sizeof(int32_t);
+    if (words < 2) return;
 
-  for (size_t i = 0; i + 1 < words; i += 2) {
-    // Accumulate normalized PCM energy for a 100 ms RMS dBFS reading.
-    // ICS43434 drives only its SEL-selected slot; choose whichever slot is active.
-    const int64_t leftMagnitude = frames[i] < 0 ? -static_cast<int64_t>(frames[i]) : frames[i];
-    const int64_t rightMagnitude = frames[i + 1] < 0 ? -static_cast<int64_t>(frames[i + 1]) : frames[i + 1];
-    const int32_t raw = leftMagnitude >= rightMagnitude ? frames[i] : frames[i + 1];
-    const double normalized = static_cast<double>(raw) / 2147483648.0;
-    sumSq += normalized * normalized;
-    ++count;
-    if (pcmCount < 64) {
-      // Quantize 32-bit left-justified I2S PCM to 16-bit signed PCM
-      pcmBuf[pcmCount++] = static_cast<int16_t>(constrain(raw >> 16, -32768, 32767));
+    // ICS43434 drives only its SEL-selected slot; pick the active slot once per block
+    // (not per frame) so quiet passages don't flip into the silent slot and add noise.
+    int64_t leftEnergy = 0, rightEnergy = 0;
+    for (size_t i = 0; i + 1 < words; i += 2) {
+      leftEnergy += frames[i] < 0 ? -static_cast<int64_t>(frames[i]) : frames[i];
+      rightEnergy += frames[i + 1] < 0 ? -static_cast<int64_t>(frames[i + 1]) : frames[i + 1];
     }
-  }
+    const size_t slot = leftEnergy >= rightEnergy ? 0 : 1;
 
-  {
-    AudioLock lock;
-    audioSquareSum += sumSq;
-    audioSampleCount += count;
-    if (audioStreaming) {
-      for (size_t i = 0; i < pcmCount && audioPcm16Count < AUDIO_PCM16_BUFFER_SIZE; ++i) {
-        audioPcm16Samples[audioPcm16Count++] = pcmBuf[i];
+    double sumSq = 0.0;
+    uint32_t count = 0;
+    int16_t pcmBuf[128];
+    size_t pcmCount = 0;
+    for (size_t i = 0; i + 1 < words; i += 2) {
+      const int32_t raw = frames[i + slot];
+      const double normalized = static_cast<double>(raw) / 2147483648.0;
+      sumSq += normalized * normalized;
+      ++count;
+      if (pcmCount < 128) {
+        // Quantize 32-bit left-justified I2S PCM to 16-bit signed PCM
+        pcmBuf[pcmCount++] = static_cast<int16_t>(constrain(raw >> 16, -32768, 32767));
       }
     }
+
+    {
+      AudioLock lock;
+      audioSquareSum += sumSq;
+      audioSampleCount += count;
+      if (audioStreaming) {
+        for (size_t i = 0; i < pcmCount && audioPcm16Count < AUDIO_PCM16_BUFFER_SIZE; ++i) {
+          audioPcm16Samples[audioPcm16Count++] = pcmBuf[i];
+        }
+      }
+    }
+
+    if (bytesRead < sizeof(frames)) return; // DMA drained for now
   }
 }
 
@@ -691,21 +712,27 @@ void sendTelemetryPacket() {
             ",\"audio_samples\":" + String(currentAudioSampleCount) +
             ",\"audio_dbfs\":" + String(audioDbfs, 2);
   if (currentAudioStreaming) {
+    // Both links carry 4-bit IMA-ADPCM (4:1 compression) so audio fits the serial and
+    // BLE bandwidth without dropping samples. Each 100 ms block is self-contained: a
+    // 4-byte header seeds the decoder with the exact first sample so blocks stay
+    // drop-tolerant without a click at every boundary, and no connect-time handshake
+    // is needed on the USB link.
     if (!bleSubscribed) {
-      // USB Serial (Wired): output 16-bit 16 kHz signed PCM audio Base64 (audio_pcm_s16_b64)
+      // USB Serial (Wired): full 16 kHz IMA-ADPCM (audio_adpcm_b64)
+      uint8_t adpcmBuf[AUDIO_PCM16_BUFFER_SIZE / 2 + 8];
+      const size_t adpcmBytes = bleAdpcmEncoder.encodeBlockSelfContained(currentAudioPcm16Samples, currentAudioPcm16Count, adpcmBuf);
       packet += ",\"audio_rate_hz\":" + String(AUDIO_PLAYBACK_RATE_USB) +
-                ",\"audio_pcm_s16_b64\":\"" +
-                encodeBase64(reinterpret_cast<const uint8_t *>(currentAudioPcm16Samples), currentAudioPcm16Count * sizeof(int16_t)) + "\"";
+                ",\"audio_adpcm_b64\":\"" +
+                encodeBase64(adpcmBuf, adpcmBytes) + "\"";
     } else {
-      // BLE Wireless: output 4-bit IMA-ADPCM compressed audio Base64 (audio_adpcm_b64)
-      // Downsample 16 kHz to 8 kHz by taking every 2nd sample
+      // BLE Wireless: 8 kHz IMA-ADPCM (downsample 16 kHz -> 8 kHz by taking every 2nd sample)
       int16_t pcm8k[AUDIO_PCM16_BUFFER_SIZE / 2];
       size_t count8k = 0;
       for (size_t i = 0; i < currentAudioPcm16Count; i += 2) {
         pcm8k[count8k++] = currentAudioPcm16Samples[i];
       }
-      uint8_t adpcmBuf[AUDIO_PCM16_BUFFER_SIZE / 4];
-      const size_t adpcmBytes = bleAdpcmEncoder.encodeBlock(pcm8k, count8k, adpcmBuf);
+      uint8_t adpcmBuf[AUDIO_PCM16_BUFFER_SIZE / 4 + 8];
+      const size_t adpcmBytes = bleAdpcmEncoder.encodeBlockSelfContained(pcm8k, count8k, adpcmBuf);
       packet += ",\"audio_rate_hz\":" + String(AUDIO_PLAYBACK_RATE_BLE) +
                 ",\"audio_adpcm_b64\":\"" +
                 encodeBase64(adpcmBuf, adpcmBytes) + "\"";
@@ -851,7 +878,11 @@ void sensor_app_task(void *pvParameters) {
 }
 
 void setup() {
-  Serial.begin(115200);
+  // Audio is sent compressed as 4-bit IMA-ADPCM (4:1), so ~16 kHz voice fits well
+  // within 230400 baud (~23 KB/s). 230400 is a standard rate the macOS CP210x driver
+  // and Chrome Web Serial handle reliably (higher custom rates like 921600 are
+  // driver-flaky on macOS and corrupt the stream).
+  Serial.begin(230400);
   delay(300);
 
   i2cMutex = xSemaphoreCreateMutex();
@@ -946,7 +977,7 @@ void setup() {
   xTaskCreatePinnedToCore(
     telemetry_net_task,
     "telemetry_net",
-    8192,
+    12288,
     nullptr,
     2,
     nullptr,
@@ -956,7 +987,7 @@ void setup() {
   xTaskCreatePinnedToCore(
     sensor_app_task,
     "sensor_app",
-    8192,
+    12288,
     nullptr,
     2,
     nullptr,
