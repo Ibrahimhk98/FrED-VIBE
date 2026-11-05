@@ -4,11 +4,14 @@ import { newSession, sessionCount, MAX_RECORDING_BYTES, ENV_FIELDS, IMU_FIELDS }
 import { hdf5Job, download } from './files.js';
 import { loadKits, rememberKit, validHost, availableKits, KIT_STORAGE_KEY } from './kits.js';
 import { createExplorerWindow } from './workspace.js';
+import { loadRecordingFolder, rememberRecordingFolder, ensureFolderWritePermission, recordingFilename, writeRecordingFile } from './recording-location.js';
 const $ = id => document.getElementById(id);
 const SERVICE = '7f510001-5b8d-4a84-9c7c-a07142ab6002', DATA = '7f510002-5b8d-4a84-9c7c-a07142ab6002', COMMAND = '7f510003-5b8d-4a84-9c7c-a07142ab6002';
 let active, connecting = false, handoff = false, handoffTimer, recording = false, session = newSession();
 let previousFrame, missingFrames = 0, malformed = 0, lastAudioAt = 0, lastFrame, exporting = false, unsaved = false;
 let commandChain = Promise.resolve();
+let recordingFolder = null, folderBusy = true;
+const canChooseFolder = typeof window.showDirectoryPicker === 'function';
 let kitStorage;
 try { kitStorage = localStorage; } catch {}
 let kits = loadKits(kitStorage);
@@ -24,7 +27,9 @@ function controls() {
   $('clock').disabled = !active || recording;
   $('wifiEnable').disabled = !active || active.kind === 'ws' || handoff;
   $('wifiOff').disabled = !active;
-  $('save').disabled = recording || exporting || !sessionCount(session);
+  $('save').disabled = recording || exporting || folderBusy || !sessionCount(session);
+  $('chooseRecordingFolder').disabled = !canChooseFolder || folderBusy || exporting;
+  $('useDownloads').disabled = !recordingFolder || folderBusy || exporting;
   $('clear').disabled = recording || exporting;
   $('recCounter').style.display = recording ? 'inline-flex' : 'none';
 }
@@ -334,14 +339,59 @@ $('wifiEnable').onclick = async () => {
 $('wifiOff').onclick = async () => { try { await sendCommand({cmd:'wifi_off'}); status('Wi-Fi turning off. Reconnect with Bluetooth or USB.'); } catch(e) { status(e.message); } };
 $('clock').onclick = async () => { try { await sendCommand({cmd:'set_time', unix_ms:Date.now()}); } catch(e) { status(e.message); } };
 $('clear').onclick = () => { if (!sessionCount(session) || confirm('Clear this recording?')) {session = newSession(); unsaved = false; controls(); status('Recording cleared');} };
-$('save').onclick = async () => {
-  exporting = true; controls(); status('Compressing HDF5 recording…');
+function showRecordingFolder(message) {
+  $('recordingFolder').textContent = recordingFolder ? recordingFolder.name : 'Browser download location';
+  $('recordingFolderHint').textContent = message || (recordingFolder
+    ? 'Export HDF5 saves into this folder. Stop, then export to write the file.'
+    : canChooseFolder ? 'Choose where Export HDF5 saves your recordings. Stop, then export to write the file.'
+    : 'Folder selection requires desktop Chrome or Edge. Exports use your browser’s download settings.');
+  controls();
+}
+$('chooseRecordingFolder').onclick = async () => {
+  folderBusy = true; controls();
   try {
+    const folder = await window.showDirectoryPicker({id:'pal-recordings', mode:'readwrite', startIn:recordingFolder || 'documents'});
+    recordingFolder = folder;
+    try {await rememberRecordingFolder(folder); showRecordingFolder();}
+    catch {showRecordingFolder('Folder selected for this tab. Browser storage could not remember it for next time.');}
+  } catch (error) {
+    if (error.name !== 'AbortError') showRecordingFolder(`Folder selection failed: ${error.message}. Your existing location is unchanged.`);
+  } finally {folderBusy = false; controls();}
+};
+$('useDownloads').onclick = async () => {
+  folderBusy = true; recordingFolder = null; controls();
+  try {await rememberRecordingFolder(null); showRecordingFolder();}
+  catch {showRecordingFolder('Using browser downloads for this tab. The saved folder setting could not be cleared.');}
+  finally {folderBusy = false; controls();}
+};
+(async () => {
+  try {
+    if (canChooseFolder) {
+      const folder = await loadRecordingFolder();
+      if (folder?.kind === 'directory') recordingFolder = folder;
+    }
+    showRecordingFolder();
+  } catch {showRecordingFolder();}
+  finally {folderBusy = false; controls();}
+})();
+$('save').onclick = async () => {
+  if (recording || exporting || folderBusy || !sessionCount(session)) return;
+  const destination = recordingFolder, filename = recordingFilename(session);
+  exporting = true; controls();
+  try {
+    if (destination) {status('Checking recording folder access…'); await ensureFolderWritePermission(destination);}
+    status('Compressing HDF5 recording…');
     const bytes = await hdf5Job({action:'write', session});
-    download(bytes, `pal-${session.device?.id || 'unknown'}-${new Date(session.started).toISOString().replace(/[:.]/g,'-')}.h5`, 'application/x-hdf5');
+    if (destination) {
+      const name = await writeRecordingFile(destination, filename, bytes);
+      status(`Saved ${destination.name}/${name} · ${(bytes.length / 1048576).toFixed(2)} MB`);
+    } else {
+      download(bytes, filename, 'application/x-hdf5');
+      status(`HDF5 download requested · ${(bytes.length / 1048576).toFixed(2)} MB`);
+    }
     unsaved = false;
-    status(`Saved HDF5 recording · ${(bytes.length / 1048576).toFixed(2)} MB`);
-  } catch(e) { status(e.message); } finally { exporting = false; controls(); }
+  } catch(e) { status(`Export failed: ${e.message} Your recording is retained; choose another location and retry.`); }
+  finally { exporting = false; controls(); }
 };
 const openExplorer = createExplorerWindow(window, () => session, () => ({
   recording, connected:!!active, device:active?.deviceIdentity?.name || session.device?.name,

@@ -347,6 +347,12 @@ input, select { padding: 9px 12px; border-radius: 8px; background:#111c2c; borde
 label { font-size:.82rem; color:#cbd5e1; display:inline-flex; flex-direction:column; gap:6px; }
 .hint { color:#94a3b8; font-size:.82rem; line-height:1.6; }
 .controls-dock { align-content:start; }
+.recording-controls { grid-column:1 / -1; }
+.recording-location { flex-basis:100%; width:100%; border-bottom:1px solid #334155; padding-bottom:12px; }
+.recording-location label { display:flex; }
+.recording-location output { color:#f8fafc; font-size:1rem; overflow-wrap:anywhere; }
+.folder-actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
+.recording-location .hint { margin-bottom:0; }
 .connection-card { margin-bottom:20px; }
 .connection-card .controls-dock { margin:14px 0; }
 nav { display:flex; gap:12px; margin-bottom:22px; }

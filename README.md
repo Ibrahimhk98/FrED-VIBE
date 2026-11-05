@@ -63,6 +63,19 @@ connection stops recording and retains the captured data. A new recording or
 Clear asks before discarding an existing session. Export is disabled while
 recording so the saved file has a definite end.
 
+Use **Recording location → Choose folder…** to select an HDF5 export folder.
+The folder name is shown beside the recording controls and remembered in this
+browser. After **Stop**, **Export HDF5** writes directly into that folder; the
+browser may ask you to allow access again after a restart. Repeated exports get
+a numbered filename instead of replacing an existing recording. Cancelling the
+picker keeps the current location. Permission or disk errors retain the recording
+in memory so you can select another folder and retry.
+
+**Use browser downloads** restores the default download behavior. Folder selection
+requires a browser supporting the File System Access API, such as desktop Chrome
+or Edge. Other browsers use their download settings. Choosing a folder does not
+enable automatic saving during capture; stop and export each recording.
+
 Recordings remain in browser memory until exported; closing/reloading the page
 loses unexported data; a leave-page warning protects active connections and
 unexported recordings. Switching to analysis or returning through its navigation

@@ -79,7 +79,12 @@
       </div>
     </div>
 
-    <div class="glass-card controls-dock">
+    <div class="glass-card controls-dock recording-controls">
+      <div class="recording-location">
+        <label>Recording location<output id="recordingFolder" aria-live="polite">Browser download location</output></label>
+        <div class="folder-actions"><button id="chooseRecordingFolder">Choose folder…</button><button id="useDownloads" disabled>Use browser downloads</button></div>
+        <p id="recordingFolderHint" class="hint">Choose where Export HDF5 saves your recordings. Stop, then export to write the file.</p>
+      </div>
       <button id="record" class="btn-record">● Record</button>
       <button id="stop" class="secondary" disabled>■ Stop</button>
       <button id="explore">Explore recording ↗</button>
