@@ -158,8 +158,9 @@ public:
 
   // Counterpart to encodeBlockSelfContained: reads the 4-byte header to seed the
   // predictor with the exact first sample, then decodes the packed nibbles.
-  size_t decodeBlockSelfContained(const uint8_t *adpcmInput, size_t inputBytes, int16_t *pcmOutput) {
-    if (inputBytes < 4) return 0;
+  size_t decodeBlockSelfContained(const uint8_t *adpcmInput, size_t inputBytes, int16_t *pcmOutput, size_t sampleCount) {
+    // Reject malformed blocks and never emit the padded high nibble.
+    if (!sampleCount || inputBytes != 4 + sampleCount / 2 || adpcmInput[2] > 88) return 0;
     predictedSample = static_cast<int16_t>(adpcmInput[0] | (adpcmInput[1] << 8));
     stepIndex = adpcmInput[2];
     if (stepIndex < 0) stepIndex = 0;
@@ -169,7 +170,7 @@ public:
     for (size_t i = 4; i < inputBytes; ++i) {
       uint8_t byte = adpcmInput[i];
       pcmOutput[outSamples++] = decodeNibble(byte & 0x0F);
-      pcmOutput[outSamples++] = decodeNibble((byte >> 4) & 0x0F);
+      if (outSamples < sampleCount) pcmOutput[outSamples++] = decodeNibble((byte >> 4) & 0x0F);
     }
     return outSamples;
   }

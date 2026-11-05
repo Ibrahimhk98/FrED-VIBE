@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdint>
 #include "ima_adpcm.h"
+#include "ble_packet.h"
 
 static inline int32_t constrainVal(int32_t val, int32_t minVal, int32_t maxVal) {
   return val < minVal ? minVal : (val > maxVal ? maxVal : val);
@@ -288,6 +289,32 @@ void test_iaq_calculation() {
 }
 
 
+void test_self_contained_audio_exact_length() {
+  for (size_t count : {1, 2, 3, 1600}) {
+    int16_t input[1600], output[1601];
+    for (size_t i = 0; i < count; ++i) input[i] = static_cast<int16_t>(1000 + 100 * sin(i * .1));
+    output[count] = 12345;
+    uint8_t block[804];
+    ImaAdpcmEncoder encoder;
+    ImaAdpcmDecoder decoder;
+    size_t bytes = encoder.encodeBlockSelfContained(input, count, block);
+    TEST_ASSERT_EQUAL_UINT32(4 + count / 2, bytes);
+    TEST_ASSERT_EQUAL_UINT32(count, decoder.decodeBlockSelfContained(block, bytes, output, count));
+    TEST_ASSERT_EQUAL_INT16(input[0], output[0]);
+    TEST_ASSERT_EQUAL_INT16(12345, output[count]);
+    TEST_ASSERT_EQUAL_UINT32(0, decoder.decodeBlockSelfContained(block, bytes - 1, output, count));
+  }
+}
+
+void test_ble_wire_checksum_and_endianness() {
+  const uint8_t vector[] = {'1','2','3','4','5','6','7','8','9'};
+  TEST_ASSERT_EQUAL_HEX32(0xcbf43926, palCrc32(vector, sizeof(vector)));
+  uint8_t bytes[8] = {};
+  palWriteLE(bytes, 0x1122334455667788ULL, 8);
+  const uint8_t expected[] = {0x88,0x77,0x66,0x55,0x44,0x33,0x22,0x11};
+  TEST_ASSERT_EQUAL_UINT8_ARRAY(expected, bytes, 8);
+}
+
 int main(int argc, char **argv) {
   UNITY_BEGIN();
   RUN_TEST(test_base64_encoding);
@@ -299,6 +326,8 @@ int main(int argc, char **argv) {
   RUN_TEST(test_imu_fifo_unpacking);
   RUN_TEST(test_adpcm_encoder_decoder_roundtrip);
   RUN_TEST(test_iaq_calculation);
+  RUN_TEST(test_self_contained_audio_exact_length);
+  RUN_TEST(test_ble_wire_checksum_and_endianness);
   return UNITY_END();
 }
 
