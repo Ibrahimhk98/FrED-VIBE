@@ -1,3 +1,5 @@
+import { pcmScale } from './session.js';
+import { audioIntegrity } from './audio-timeline.js';
 import { sessionBounds, sessionCount, renderAudio, wavBytes } from './session.js';
 import { hdf5Job, download } from './files.js';
 import { returnToAcquisition } from './workspace.js';
@@ -20,7 +22,9 @@ function load(value, label) {
   const rates = [...new Set(session.audio.map(f => f.rate))].join(' / ');
   const unsynced = session.audio.some(f => !f.clock_synced);
   $('summary').textContent = `${session.device ? session.device.name + " (" + session.device.id + ") · " : ""}${label} · ${seconds.toFixed(2)} s timeline · ${session.imu.length.toLocaleString()} IMU samples · ${session.environment.length} environmental readings · ${audioSeconds.toFixed(2)} s audio${rates ? ' at '+rates+' Hz' : ''} · ${session.malformed || 0} malformed packets${unsynced ? ' · Some timestamps have an unsynchronized device clock' : ''}`;
-  status('Recording ready'); draw();
+  const integrity=audioIntegrity(session.audio);
+  $('summary').textContent+=` · ${integrity.missingFrames} missing audio frames (${(integrity.missingMs/1000).toFixed(3)} s) · ${integrity.captureDrops} capture queue drops during this recording`;
+  status(integrity.missingMs ? 'Audio gaps are shown at their acquisition times; playback preserves them.' : 'Recording ready'); draw();
 }
 function range() {
   const total = Math.max(.001,(bounds[1]-bounds[0])/1000);
@@ -71,7 +75,7 @@ function linePlot(id, rows, fields, start, end) {
 function audioPlot(start,end) {
   let low=Infinity,high=-Infinity;
   const frames=session.audio.filter(f => f.time_ms<end && f.time_ms+f.pcm.length*1000/f.rate>start);
-  for(const f of frames) for(let i=Math.max(0,Math.floor((start-f.time_ms)*f.rate/1000));i<Math.min(f.pcm.length,Math.ceil((end-f.time_ms)*f.rate/1000));i++) {low=Math.min(low,f.pcm[i]/32768);high=Math.max(high,f.pcm[i]/32768);}
+  for(const f of frames) for(let i=Math.max(0,Math.floor((start-f.time_ms)*f.rate/1000));i<Math.min(f.pcm.length,Math.ceil((end-f.time_ms)*f.rate/1000));i++) {low=Math.min(low,f.pcm[i]/pcmScale(f));high=Math.max(high,f.pcm[i]/pcmScale(f));}
   if(!Number.isFinite(low)){low=-.0001;high=.0001;}
   if(high-low<.0001){low-=.00005;high+=.00005;}
   const {ctx,x,y,left,right}=axes($('audioPlot'),low,high,start,end);
@@ -80,12 +84,12 @@ function audioPlot(start,end) {
     const from=Math.max(0,Math.ceil((start-f.time_ms)*f.rate/1000)), to=Math.min(f.pcm.length,Math.ceil((end-f.time_ms)*f.rate/1000));
     const perPixel=(end-start)*f.rate/1000/(right-left);
     if(perPixel<=1) {
-      for(let i=from;i<to;i++){const xx=x(f.time_ms+i*1000/f.rate), yy=y(f.pcm[i]/32768);i===from?ctx.moveTo(xx,yy):ctx.lineTo(xx,yy);}
+      for(let i=from;i<to;i++){const xx=x(f.time_ms+i*1000/f.rate), yy=y(f.pcm[i]/pcmScale(f));i===from?ctx.moveTo(xx,yy):ctx.lineTo(xx,yy);}
     } else {
       for(let i=from;i<to;) {
-        const column=Math.floor(x(f.time_ms+i*1000/f.rate));let min=32767,max=-32768;
+        const column=Math.floor(x(f.time_ms+i*1000/f.rate));let min=Infinity,max=-Infinity;
         do {min=Math.min(min,f.pcm[i]);max=Math.max(max,f.pcm[i]);i++;} while(i<to && Math.floor(x(f.time_ms+i*1000/f.rate))===column);
-        ctx.moveTo(column,y(max/32768));ctx.lineTo(column,y(min/32768));
+        ctx.moveTo(column,y(max/pcmScale(f)));ctx.lineTo(column,y(min/pcmScale(f)));
       }
     }
   }
@@ -135,7 +139,7 @@ for(const id of ['audioPlot','accelPlot','gyroPlot','envPlot']) $(id).addEventLi
   let detail='No sample';
   if(id==='audioPlot') {
     const f=session.audio.find(f=>t>=f.time_ms && t<f.time_ms+f.pcm.length*1000/f.rate);
-    if(f){const i=Math.floor((t-f.time_ms)*f.rate/1000);detail=`PCM ${f.pcm[i]} · amplitude ${(f.pcm[i]/32768).toFixed(6)} · ${f.codec} / ${f.transport}`;}
+    if(f){const i=Math.floor((t-f.time_ms)*f.rate/1000);detail=`PCM ${f.pcm[i]} · amplitude ${(f.pcm[i]/pcmScale(f)).toFixed(6)} · ${f.codec} / ${f.transport}`;}
   }else{
     const rows=id==='envPlot'?session.environment:session.imu;let closest,delta=Infinity;
     for(const r of rows){const d=Math.abs(r.time_ms-t);if(d<delta){delta=d;closest=r;}}

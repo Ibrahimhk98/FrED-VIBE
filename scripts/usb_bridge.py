@@ -30,11 +30,25 @@ async def run(port):
         device = None
         tasks = []
         try:
-            device = serial.Serial(port, 230400, timeout=0.1, write_timeout=1)
+            device = serial.Serial(port=None, baudrate=230400, timeout=0.02, write_timeout=1)
+            device.dtr = device.rts = False
+            device.port = port
+            device.open()
+            # Some native CDC hosts toggle reset despite the requested line state.
+            # Drain boot output and pre-connection backlog before exposing a stream.
+            ready_at = asyncio.get_running_loop().time() + 1
+            while asyncio.get_running_loop().time() < ready_at:
+                await asyncio.to_thread(device.read, 16384)
 
             async def read():
+                aligned = False
                 while True:
-                    chunk = await asyncio.to_thread(device.read, 4096)
+                    chunk = await asyncio.to_thread(device.read, 16384)
+                    if chunk and not aligned:
+                        _, boundary, chunk = chunk.partition(b'\n')
+                        if not boundary:
+                            continue
+                        aligned = True
                     if chunk:
                         # Firmware output is ASCII JSONL; preserve partial lines.
                         await socket.send(chunk.decode("ascii", errors="replace"))

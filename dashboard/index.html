@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>PAL V2 Pro Telemetry</title>
+  <title>FrED PAL A3 Telemetry</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
@@ -13,8 +13,8 @@
 
   <header>
     <div>
-      <h1 class="hero-title">PAL V2 Pro</h1>
-      <span class="hero-tag">ESP32 Feather V2 • Precision Multi-Sensor Telemetry Node</span>
+      <h1 class="hero-title">FrED PAL A3</h1>
+      <span class="hero-tag">Integrated sensor PCB · ESP32-S3</span>
     </div>
     <div class="status-badge">
       <span id="pulseDot" class="pulse-dot"></span>
@@ -29,9 +29,19 @@
   </div>
 
   <nav><a id="liveNav" href="index.html" aria-current="page">Live acquisition</a><a id="exploreNav" href="explorer.html" target="_blank">Data explorer ↗</a></nav>
-  <section class="glass-card connection-card">
+  <section class="glass-card connection-summary">
+    <div><p id="deviceIdentity">No kit connected</p><p id="streamHealth" class="hint" role="status">Connect a kit to start live acquisition.</p></div>
+    <div class="orientation-actions"><button id="openSetup" class="btn-primary">Connect a kit</button><button id="disconnectBtn" disabled>Disconnect</button></div>
+  </section>
+  <dialog id="deviceSetup" class="setup-dialog" aria-labelledby="setupTitle">
+    <div class="card-header"><h2 id="setupTitle">Device setup</h2><button id="closeSetup" aria-label="Close device setup">Close</button></div>
+    <div class="setup-tabs" role="tablist" aria-label="Device settings">
+      <button id="connectionTab" role="tab" aria-selected="true" aria-controls="connectionSettings">Connection</button>
+      <button id="samplingTab" role="tab" aria-selected="false" aria-controls="samplingSettings" tabindex="-1">Sampling</button>
+      <button id="firmwareTab" role="tab" aria-selected="false" aria-controls="firmwareSettings" tabindex="-1">Firmware</button>
+    </div>
+  <section id="connectionSettings" class="setup-panel" role="tabpanel" aria-labelledby="connectionTab">
     <h2>Device connection</h2>
-    <p class="hint" id="deviceIdentity">No kit connected</p>
     <div class="controls-dock">
       <label>Wi-Fi kits · name and IP<select id="kitSelect"><option value="">Choose a kit…</option></select></label>
       <button id="refreshKits">Refresh Wi-Fi kits</button>
@@ -42,12 +52,10 @@
       <button id="addKit">Remember address</button>
       <button id="forgetKit" disabled>Forget selected address</button>
       <button id="wifiConnect">Connect selected kit</button>
-      <button id="disconnectBtn">Disconnect</button>
     </div>
     <div id="networkKits" class="kit-list" aria-label="Kits discovered on this network"></div>
     <p id="discoveryStatus" class="hint" role="status">Looking for kits on the same network…</p>
-    <p class="hint">Select a kit by name and IP, then connect. Saved addresses remain available when discovery cannot reach a kit. You can also enter an IP / pal-…local hostname and choose Remember address.</p>
-    <p class="hint">USB adapter missing from the browser chooser? Start the local USB bridge described in the README, then choose Connect USB bridge.</p>
+    <p class="hint">For USB, connect a data cable with SW1 ON. Use the USB bridge if the browser cannot find the port (see README).</p>
     <details><summary>Configure Wi-Fi over Bluetooth or USB</summary>
       <p class="hint">Connect Bluetooth first, enter your 2.4 GHz network, then send and switch. The current link stays connected until Wi-Fi is ready. Credentials are held on the device until restart.</p>
       <div class="controls-dock">
@@ -57,8 +65,31 @@
         <button id="wifiOff">Turn Wi-Fi off</button>
       </div>
     </details>
-    <p id="streamHealth" role="status">Waiting for audio samples. USB / Bluetooth: 16 kHz ADPCM · Wi-Fi: 16 kHz PCM.</p>
+    <details><summary>Link diagnostics</summary><p id="radioHealth" class="hint">Connect Bluetooth to see negotiated radio settings and queue usage.</p></details>
   </section>
+  <section id="samplingSettings" class="setup-panel" role="tabpanel" aria-labelledby="samplingTab" hidden>
+    <h2>Sampling rates</h2>
+    <p id="samplingCurrent" class="hint">Connect a kit to read sampling settings.</p>
+    <div class="sampling-grid">
+      <label>Bluetooth microphone<select id="bleAudioRate" disabled><option value="16000">16 kHz · speech</option><option value="24000" selected>24 kHz · balanced</option><option value="48000">48 kHz · full bandwidth</option></select><span class="hint">Filtered preview at 16 / 24 kHz; USB and Wi-Fi always retain 48 kHz raw audio.</span></label>
+      <label>Accelerometer + gyroscope<select id="imuRate" disabled><option value="26">26 Hz</option><option value="52">52 Hz</option><option value="104" selected>104 Hz</option><option value="208">208 Hz</option><option value="416">416 Hz</option></select><span class="hint">Applies to all connections. Changing this rate starts a new motion segment and clears orientation trim.</span></label>
+    </div>
+    <button id="applySampling" class="btn-primary" disabled>Apply sampling rates</button>
+    <p id="samplingStatus" role="status">Settings apply until the board restarts.</p>
+  </section>
+  <section id="firmwareSettings" class="setup-panel firmware-card" role="tabpanel" aria-labelledby="firmwareTab" hidden>
+    <div class="card-header"><h2 id="firmwareTitle">Firmware</h2><button id="firmwareCheck">Check firmware</button></div>
+    <div class="firmware-versions"><div><span>Installed on board</span><strong id="firmwareCurrent">Connect a kit to read its version</strong></div><div><span>Available with this dashboard</span><strong id="firmwareAvailable">Checking…</strong></div></div>
+    <p id="firmwareComparison" class="hint"></p>
+    <p id="firmwareNotes" class="hint"></p>
+    <div class="controls-dock"><label>FrED PAL A3 USB port<select id="firmwarePort"><option value="">Checking USB ports…</option></select></label><button id="firmwareRead" disabled>Read USB version</button><button id="firmwareInstall" class="btn-primary" disabled>Update via USB…</button></div>
+    <p id="firmwareStatus" role="status">Checking the locally bundled firmware…</p>
+    <progress id="firmwareProgress" max="100" value="0" hidden aria-label="Firmware image write progress"></progress>
+    <p class="hint">Version checks work over any connection. Updates require USB, SW1 ON, and a stopped recording. If the board does not appear, hold BOOT, tap RESET, release BOOT, then check again.</p>
+    <details><summary>Update log</summary><pre id="firmwareLog" class="firmware-log"></pre></details>
+  </section>
+  </dialog>
+  <dialog id="firmwareConfirm" aria-labelledby="firmwareConfirmTitle"><h2 id="firmwareConfirmTitle">Update FrED PAL A3</h2><p id="firmwareConfirmText"></p><p>Your recording stays in this window. Export it before updating if you need a saved copy.</p><div class="orientation-actions"><button id="firmwareStart" class="btn-primary">Install firmware</button><button id="firmwareCancel">Cancel</button></div></dialog>
   <div class="dashboard-bar">
     <div class="glass-card time-card">
       <div>
@@ -66,35 +97,56 @@
         <div id="deviceTime" class="time-value">--:--:--</div>
         <div id="clockDrift" class="time-offset">Clock offset vs PC: --</div>
       </div>
-      <button id="clock" class="secondary">⚡ Sync RTC to PC</button>
+      <button id="clock" class="secondary">Sync clock</button>
     </div>
 
     <div class="glass-card time-card">
       <div style="width:100%;">
         <div class="time-label" style="display:flex; justify-content:space-between; align-items:center; width:100%;">
-          <span>LiPo Battery Health (GPIO35)</span>
+          <span>Battery terminal voltage · J2</span>
         </div>
-        <div id="batVal" class="time-value" style="color:var(--accent-green);">-- V (--%)</div>
-        <div id="batStatus" class="time-offset">Battery status: Waiting for telemetry…</div>
+        <div id="batVal" class="time-value" style="color:var(--accent-green);">— V</div>
+        <div id="batStatus" class="time-offset">Waiting for telemetry…</div>
+        <p class="hint">With no battery connected, the charger can cycle this voltage. Battery presence and charge state are not available.</p>
       </div>
     </div>
 
     <div class="glass-card controls-dock recording-controls">
-      <div class="recording-location">
-        <label>Recording location<output id="recordingFolder" aria-live="polite">Browser download location</output></label>
+      <details class="recording-location">
+        <summary>Save location · <output id="recordingFolder" aria-live="polite">Browser download location</output></summary>
         <div class="folder-actions"><button id="chooseRecordingFolder">Choose folder…</button><button id="useDownloads" disabled>Use browser downloads</button></div>
-        <p id="recordingFolderHint" class="hint">Choose where Export HDF5 saves your recordings. Stop, then export to write the file.</p>
-      </div>
-      <button id="record" class="btn-record">● Record</button>
-      <button id="stop" class="secondary" disabled>■ Stop</button>
+        <p id="recordingFolderHint" class="hint">Stop and export to save a recording.</p>
+      </details>
+      <button id="record" class="btn-record">Record</button>
+      <button id="stop" class="secondary" disabled>Stop</button>
       <button id="explore">Explore recording ↗</button>
-      <button id="save" class="secondary">💾 Export HDF5</button>
-      <button id="clear" class="secondary">🗑️ Clear</button>
+      <button id="save" class="secondary">Export HDF5</button>
+      <button id="clear" class="secondary">Clear</button>
       <div id="recCounter" class="rec-counter">● <span id="recCounterText">0s (0 rows)</span></div>
       <p class="hint">Analysis opens separately. This window keeps the connection and recording running; return here to stop and export.</p>
     </div>
   </div>
 
+  <section class="glass-card orientation-card">
+    <div class="card-header"><div><h2>Device orientation</h2><p id="orientationState" class="hint" role="status">Waiting for motion data</p></div><div class="orientation-actions"><button id="trimOrientation" class="btn-primary" disabled>Trim orientation</button><button id="resetOrientation" disabled>Clear trim</button></div></div>
+    <div class="orientation-layout">
+      <canvas id="deviceRender" aria-label="Three-dimensional FrED PAL A3 board rotating with live IMU data"></canvas>
+      <div class="orientation-info">
+        <div class="pose-values"><div><span>Roll</span><strong id="poseRoll">—</strong></div><div><span>Pitch</span><strong id="posePitch">—</strong></div><div><span>Relative yaw</span><strong id="poseYaw">—</strong></div></div>
+        <p>For trim, place the board <strong>flat and level, component side up</strong>, and keep it still for two seconds.</p>
+        <p class="hint">Gravity-corrected quaternion · Z up. Heading is relative and can drift.</p>
+        <p class="hint">Illustrative PCB. Calibration affects this view only; recorded sensor axes remain unchanged.</p>
+        <p id="sensorHealth" class="hint" role="status">Waiting for sensor health</p>
+      </div>
+    </div>
+  </section>
+  <dialog id="trimDialog" aria-labelledby="trimTitle">
+    <h2 id="trimTitle">Trim on a flat surface</h2>
+    <p>Place the board flat on a level surface, <strong>component side up</strong>. Keep it still for two seconds after starting.</p>
+    <p>The board's upward normal becomes world +Z. Its current heading becomes zero.</p>
+    <p id="trimProgress" role="status">Place the board flat before starting.</p>
+    <div class="orientation-actions"><button id="startTrim" class="btn-primary">Start calibration</button><button id="cancelTrim">Cancel</button></div>
+  </dialog>
   <div class="grid">
     <section class="glass-card">
       <div class="card-header">
@@ -136,6 +188,7 @@
       <div class="card-header">
         <h2>Environment (BME688)</h2>
       </div>
+      <p id="gasValidity" class="hint">Waiting for a valid environmental measurement</p>
       <div class="env-grid" id="env">
         <div class="env-tile">
           <span class="env-title">🌡️ Temperature</span>
@@ -156,30 +209,7 @@
       </div>
     </section>
 
-    <section class="glass-card">
-      <div class="card-header">
-        <h2>Indoor Air Quality (IAQ)</h2>
-        <div id="iaqBadge" class="legend-pill" style="font-size:0.82rem; padding:4px 10px;">🟢 Good (0-50)</div>
-      </div>
-      <div class="env-grid" id="iaqGrid">
-        <div class="env-tile">
-          <span class="env-title">🍃 IAQ Index</span>
-          <span class="env-num" id="iaqVal" style="color:var(--accent-green);">—</span>
-        </div>
-        <div class="env-tile">
-          <span class="env-title">🧪 VOC Equivalent</span>
-          <span class="env-num" id="vocVal" style="color:var(--accent-cyan);">— ppm</span>
-        </div>
-        <div class="env-tile">
-          <span class="env-title">💨 eCO₂ Equivalent</span>
-          <span class="env-num" id="eco2Val" style="color:var(--accent-amber);">— ppm</span>
-        </div>
-        <div class="env-tile">
-          <span class="env-title">⚡ Air Status</span>
-          <span class="env-num" id="iaqStatusText" style="font-size:1.0rem; color:var(--text-primary);">Waiting…</span>
-        </div>
-      </div>
-    </section>
+
   </div>
 
   <script type="module" src="app.js"></script>

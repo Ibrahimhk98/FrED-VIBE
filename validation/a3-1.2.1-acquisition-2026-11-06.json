@@ -1,0 +1,461 @@
+{
+  "date": "2026-11-06",
+  "firmware": "a3-1.2.1",
+  "firmware_sha256": "74de32a81ff549f0750508b9513fc9522461745b986da715cf86795c85c99476",
+  "device_id": "88cda63f1fb8",
+  "flash": {
+    "flashVerified": true,
+    "runningVerified": true,
+    "deviceId": "88cda63f1fb8",
+    "configuration": {
+      "type": "configuration",
+      "protocol": 3,
+      "hardware": "FrED PAL A3",
+      "firmware": "a3-1.2.1",
+      "ble_imu": "lossless_tagged_rate_kind4",
+      "usb_driver": "esp-idf-usb-serial-jtag",
+      "build": "Nov  6 2026 08:27:59",
+      "arduino": "2.0.17",
+      "idf": "v4.4.7-dirty",
+      "sampling_control": true,
+      "ble_audio_rate_hz": 24000,
+      "ble_filter": "kaiser129_decimation_delay_compensated_64_input_samples_24k_pass10k_stop12k_16k_pass6k_stop8k_48k_bypass",
+      "stream_id": 613488867,
+      "reset_reason": 0,
+      "flash_bytes": 8388608,
+      "psram_bytes": 8386247,
+      "audio_queue_frames": 24,
+      "queue_memory": "psram",
+      "audio": {
+        "sensor": "ICS-43432",
+        "rate_hz": 48000,
+        "wire_slots": 2,
+        "slot_bits": 32,
+        "bclk_hz": 3072000,
+        "channel": "left",
+        "container": "i2s_s32le",
+        "valid_bits": 24,
+        "alignment": "unshifted_dma_requires_bench_validation",
+        "settling_frames": 4224,
+        "ble": "ima_adpcm_lossy_preview"
+      },
+      "imu": {
+        "sensor": "LSM6DSOX",
+        "spi_hz": 1000000,
+        "spi_mode": 3,
+        "odr_hz": 104,
+        "accel_g": 4,
+        "gyro_dps": 500,
+        "axes": "native_sensor",
+        "timing": "independent_counter_estimates_not_synchronized",
+        "filter": "reset_defaults",
+        "ctrl1_4": [
+          72,
+          68,
+          68,
+          4
+        ],
+        "driver_commit": "2e86793125f7f46b6195fce93a2b3cb76a51e564"
+      },
+      "environment": {
+        "driver_commit": "80ea120a8b8ac987d7d79eb68a9ed796736be845",
+        "variant": 1,
+        "i2c_hz": 100000,
+        "address": 118,
+        "profile_id": 1,
+        "oversampling_tph": [
+          8,
+          4,
+          2
+        ],
+        "iir": "off",
+        "heater_c": 320,
+        "heater_ms": 150,
+        "outputs": "compensated_TPH_and_valid_gas_resistance"
+      },
+      "overflow_policy": "drop_newest_count_gaps",
+      "rtc_policy": "UTC_explicit_host_sync_OSF_invalid",
+      "rtc_interrupt": "disabled",
+      "battery_policy": "voltage_only_no_software_cutoff",
+      "expansion": "disabled",
+      "device_id": "88cda63f1fb8",
+      "device_name": "PAL-3f1fb8",
+      "hostname": "pal-88cda63f1fb8.local"
+    },
+    "detail": "Firmware installed and running.",
+    "readbackError": ""
+  },
+  "usb_smoke": {
+    "packets": {
+      "audio": 501,
+      "configuration": 1,
+      "telemetry": 97,
+      "health": 10,
+      "environment": 10
+    },
+    "malformed_lines": 0,
+    "invalid_audio": 0,
+    "samples": 480960,
+    "sequence_gaps": 0,
+    "sample_discontinuities": 0,
+    "first_audio": {
+      "type": "audio",
+      "protocol": 3,
+      "stream_id": 579308769,
+      "sequence": 21,
+      "segment": 0,
+      "audio_sample_index": 24384,
+      "audio_time_ms": 1793972126590,
+      "audio_monotonic_us": 966364,
+      "clock_synced": true,
+      "audio_samples": 960,
+      "audio_rate_hz": 48000,
+      "audio_dbfs": -51.58,
+      "capture_dropped_frames": 0,
+      "dma_overruns": 0,
+      "mic_slot": 0,
+      "device_id": "88cda63f1fb8",
+      "audio_codec": "i2s_s32le"
+    },
+    "last_audio": {
+      "type": "audio",
+      "protocol": 3,
+      "stream_id": 579308769,
+      "sequence": 521,
+      "segment": 0,
+      "audio_sample_index": 504384,
+      "audio_time_ms": 1793972136590,
+      "audio_monotonic_us": 10966364,
+      "clock_synced": true,
+      "audio_samples": 960,
+      "audio_rate_hz": 48000,
+      "audio_dbfs": -49.68,
+      "capture_dropped_frames": 0,
+      "dma_overruns": 0,
+      "mic_slot": 0,
+      "device_id": "88cda63f1fb8",
+      "audio_codec": "i2s_s32le"
+    },
+    "health_counter_increases": {
+      "imu_overruns": 0,
+      "imu_dropped": 0,
+      "audio_dropped": 0,
+      "audio_overruns": 0,
+      "telemetry_dropped": 0,
+      "usb_dropped": 0,
+      "ble_dropped": 0
+    },
+    "last_health": {
+      "type": "health",
+      "time_ms": 1793972136097,
+      "clock_synced": true,
+      "battery_v": 3.833,
+      "battery_pct": null,
+      "imu_ready": true,
+      "bme_ready": true,
+      "mic_ready": true,
+      "imu_overruns": 0,
+      "imu_dropped": 0,
+      "imu_unknown_tags": 0,
+      "audio_dropped": 0,
+      "audio_overruns": 0,
+      "audio_queue_high_water": 1,
+      "telemetry_dropped": 0,
+      "usb_dropped": 0,
+      "ble_dropped": 0,
+      "ble_att_payload": 20,
+      "ble_interval_ms": 0.0,
+      "ble_notify_retries": 0,
+      "free_heap": 195236,
+      "free_psram": 8253723,
+      "device_id": "88cda63f1fb8",
+      "device_name": "PAL-3f1fb8",
+      "hostname": "pal-88cda63f1fb8.local"
+    },
+    "last_environment": {
+      "type": "environment",
+      "time_ms": 1793972136298,
+      "clock_synced": true,
+      "monotonic_us": 10674871,
+      "temperature_c": 26.643,
+      "humidity_pct": 48.839,
+      "pressure_hpa": 1013.019,
+      "gas_ohms": 137931.03,
+      "new_data": true,
+      "gas_valid": true,
+      "heater_stable": true,
+      "measurement_index": 0,
+      "profile_id": 1,
+      "device_id": "88cda63f1fb8"
+    },
+    "status": [
+      {
+        "type": "configuration",
+        "protocol": 3,
+        "hardware": "FrED PAL A3",
+        "firmware": "a3-1.2.1",
+        "ble_imu": "lossless_tagged_rate_kind4",
+        "usb_driver": "esp-idf-usb-serial-jtag",
+        "build": "Nov  6 2026 08:27:59",
+        "arduino": "2.0.17",
+        "idf": "v4.4.7-dirty",
+        "sampling_control": true,
+        "ble_audio_rate_hz": 24000,
+        "ble_filter": "kaiser129_decimation_delay_compensated_64_input_samples_24k_pass10k_stop12k_16k_pass6k_stop8k_48k_bypass",
+        "stream_id": 579308769,
+        "reset_reason": 0,
+        "flash_bytes": 8388608,
+        "psram_bytes": 8386167,
+        "audio_queue_frames": 24,
+        "queue_memory": "psram",
+        "audio": {
+          "sensor": "ICS-43432",
+          "rate_hz": 48000,
+          "wire_slots": 2,
+          "slot_bits": 32,
+          "bclk_hz": 3072000,
+          "channel": "left",
+          "container": "i2s_s32le",
+          "valid_bits": 24,
+          "alignment": "unshifted_dma_requires_bench_validation",
+          "settling_frames": 4224,
+          "ble": "ima_adpcm_lossy_preview"
+        },
+        "imu": {
+          "sensor": "LSM6DSOX",
+          "spi_hz": 1000000,
+          "spi_mode": 3,
+          "odr_hz": 104,
+          "accel_g": 4,
+          "gyro_dps": 500,
+          "axes": "native_sensor",
+          "timing": "independent_counter_estimates_not_synchronized",
+          "filter": "reset_defaults",
+          "ctrl1_4": [
+            72,
+            68,
+            68,
+            4
+          ],
+          "driver_commit": "2e86793125f7f46b6195fce93a2b3cb76a51e564"
+        },
+        "environment": {
+          "driver_commit": "80ea120a8b8ac987d7d79eb68a9ed796736be845",
+          "variant": 1,
+          "i2c_hz": 100000,
+          "address": 118,
+          "profile_id": 1,
+          "oversampling_tph": [
+            8,
+            4,
+            2
+          ],
+          "iir": "off",
+          "heater_c": 320,
+          "heater_ms": 150,
+          "outputs": "compensated_TPH_and_valid_gas_resistance"
+        },
+        "overflow_policy": "drop_newest_count_gaps",
+        "rtc_policy": "UTC_explicit_host_sync_OSF_invalid",
+        "rtc_interrupt": "disabled",
+        "battery_policy": "voltage_only_no_software_cutoff",
+        "expansion": "disabled",
+        "device_id": "88cda63f1fb8",
+        "device_name": "PAL-3f1fb8",
+        "hostname": "pal-88cda63f1fb8.local"
+      }
+    ]
+  },
+  "ble_direct_rate_change_smoke": {
+    "firmware": "a3-1.2.1",
+    "malformed": 0,
+    "packets": {
+      "configuration": 4,
+      "telemetry": 368,
+      "audio": 1878,
+      "environment": 38,
+      "health": 37,
+      "status": 2
+    },
+    "segments": [
+      {
+        "segment": 1,
+        "rate": 24000,
+        "frames": 616,
+        "samples": 295680,
+        "missingFrames": 0,
+        "missingSamples": 0,
+        "missingMs": 0,
+        "captureDrops": 0,
+        "discontinuities": 0
+      },
+      {
+        "segment": 2,
+        "rate": 16000,
+        "frames": 262,
+        "samples": 83840,
+        "missingFrames": 0,
+        "missingSamples": 0,
+        "missingMs": 0,
+        "captureDrops": 0,
+        "discontinuities": 0
+      },
+      {
+        "segment": 3,
+        "rate": 24000,
+        "frames": 1000,
+        "samples": 480000,
+        "missingFrames": 0,
+        "missingSamples": 0,
+        "missingMs": 0,
+        "captureDrops": 0,
+        "discontinuities": 0
+      }
+    ],
+    "settings": [
+      {
+        "ble_audio_hz": 24000,
+        "imu_hz": 104,
+        "usb_audio_hz": 48000
+      },
+      {
+        "ble_audio_hz": 24000,
+        "imu_hz": 104,
+        "usb_audio_hz": 48000
+      },
+      {
+        "ble_audio_hz": 16000,
+        "imu_hz": 26,
+        "usb_audio_hz": 48000
+      },
+      {
+        "ble_audio_hz": 24000,
+        "imu_hz": 104,
+        "usb_audio_hz": 48000
+      }
+    ],
+    "acknowledgements": [
+      "sampling_applied",
+      "sampling_applied"
+    ],
+    "first_health": {
+      "type": "health",
+      "time_ms": 1793971864105,
+      "clock_synced": true,
+      "battery_v": 3.833,
+      "battery_pct": null,
+      "imu_ready": true,
+      "bme_ready": true,
+      "mic_ready": true,
+      "imu_overruns": 0,
+      "imu_dropped": 0,
+      "imu_unknown_tags": 0,
+      "audio_dropped": 0,
+      "audio_overruns": 13,
+      "audio_queue_high_water": 2,
+      "telemetry_dropped": 0,
+      "usb_dropped": 789,
+      "ble_dropped": 0,
+      "ble_att_payload": 495,
+      "ble_interval_ms": 15,
+      "ble_notify_retries": 0,
+      "free_heap": 194884,
+      "free_psram": 8264763,
+      "device_id": "88cda63f1fb8",
+      "device_name": "PAL-3f1fb8",
+      "hostname": "pal-88cda63f1fb8.local"
+    },
+    "last_health": {
+      "type": "health",
+      "time_ms": 1793971900183,
+      "clock_synced": true,
+      "battery_v": 3.833,
+      "battery_pct": null,
+      "imu_ready": true,
+      "bme_ready": true,
+      "mic_ready": true,
+      "imu_overruns": 0,
+      "imu_dropped": 10,
+      "imu_unknown_tags": 0,
+      "audio_dropped": 0,
+      "audio_overruns": 13,
+      "audio_queue_high_water": 2,
+      "telemetry_dropped": 0,
+      "usb_dropped": 3022,
+      "ble_dropped": 0,
+      "ble_att_payload": 495,
+      "ble_interval_ms": 15,
+      "ble_notify_retries": 0,
+      "free_heap": 195100,
+      "free_psram": 8269915,
+      "device_id": "88cda63f1fb8",
+      "device_name": "PAL-3f1fb8",
+      "hostname": "pal-88cda63f1fb8.local"
+    }
+  },
+  "chrome_recording_hdf5_readback": {
+    "firmware": "a3-1.2.1",
+    "device": {
+      "id": "88cda63f1fb8",
+      "name": "PAL-3f1fb8"
+    },
+    "ble_audio_rate_hz": 24000,
+    "imu_rate_hz": 104,
+    "raw_audio_rate_hz": 48000,
+    "audio_frames": 2267,
+    "samples": 1088160,
+    "duration_seconds": 45.34000000000149,
+    "audio_rates": [
+      24000
+    ],
+    "imu_samples": 4600,
+    "imu_raw_records": 9200,
+    "environment_readings": 45,
+    "malformed": 0,
+    "missingFrames": 0,
+    "missingSamples": 0,
+    "missingMs": 0,
+    "captureDrops": 0,
+    "discontinuities": 0,
+    "health_counter_increases": {
+      "imu_overruns": 0,
+      "audio_dropped": 0,
+      "audio_overruns": 0,
+      "telemetry_dropped": 0,
+      "ble_dropped": 0
+    }
+  },
+  "ui_checks": {
+    "configuration_loaded_on_connect": true,
+    "firmware_version_read_over_ble": true,
+    "imu_rate_applied_and_read_back_hz": [
+      52,
+      104
+    ],
+    "flat_trim_prompt_shown": true,
+    "flat_trim_completed": true,
+    "flat_pose_after_trim_degrees": {
+      "roll": 0.0,
+      "pitch": 0.0,
+      "relative_yaw": 0.0
+    },
+    "data_explorer_missing_audio_frames": 0,
+    "data_explorer_capture_queue_drop_increase": 0,
+    "recording_exported_and_read_back": true
+  },
+  "software_checks": {
+    "javascript_tests_passed": 38,
+    "native_tests_passed": 10,
+    "firmware_build": "passed",
+    "python_compile": "passed",
+    "git_diff_check": "passed"
+  },
+  "scope_notes": [
+    "USB and Wi-Fi retain raw 48 kHz DMA words. The microphone rate control affects BLE only.",
+    "Measured BLE segments exclude the deliberate FIR restart frame at a sample-rate transition. Both rate-change commands were acknowledged.",
+    "UI recording began after sampling changes. The exported 45.34 s recording has zero audio gaps and zero increases in capture, DMA, IMU, BLE or telemetry drop counters.",
+    "Device counters are cumulative: the direct BLE test began with 13 DMA overruns already counted. IMU rate changes deliberately discard pending motion records and start new segments.",
+    "USB drop counters increase when no USB reader is attached; this is separate from BLE delivery.",
+    "These are finite smoke checks, not a guarantee of lossless radio delivery or electrical qualification. No microphone waveform is included in this report."
+  ]
+}

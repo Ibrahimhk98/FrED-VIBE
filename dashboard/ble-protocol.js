@@ -37,6 +37,21 @@ export function decodeBlePacket(kind, bytes) {
     });
     return {type:'telemetry', protocol:2, device_id, time_ms:time, imu};
   }
+  if (kind === 3 || kind === 4) {
+    const header=kind===4?42:40;
+    if(bytes.length<header)throw new Error('Truncated A3 Bluetooth IMU header');
+    const count=bytes[39], baseUs=Number(view.getBigUint64(14,true));
+    const rate=kind===4?view.getUint16(40,true):104;
+    if(![26,52,104,208,416].includes(rate) || !count || count>32 || bytes.length!==header+17*count || bytes[38]>1 || !Number.isSafeInteger(baseUs) || !Number.isSafeInteger(time))throw new Error('Invalid A3 Bluetooth IMU packet');
+    const imu_raw=Array.from({length:count},(_,i)=>{
+      const p=header+i*17, tag=bytes[p+6], us=baseUs+view.getInt32(p,true), ms=time+view.getInt16(p+4,true);
+      if(![1,2].includes(tag) || !Number.isSafeInteger(us) || us<0 || ms<0)throw new Error('Invalid A3 Bluetooth IMU record');
+      return [us,tag,view.getInt16(p+7,true),view.getInt16(p+9,true),view.getInt16(p+11,true),view.getUint32(p+13,true),ms];
+    });
+    return {type:'telemetry',protocol:3,device_id,time_ms:time,clock_synced:!!bytes[38],imu_rate_hz:rate,
+      stream_id:view.getUint32(22,true),imu_segment:view.getUint32(26,true),
+      imu_overruns:view.getUint32(30,true),imu_dropped:view.getUint32(34,true),imu_raw};
+  }
   throw new Error('Unknown Bluetooth packet kind');
 }
 
@@ -56,7 +71,7 @@ export class BlePacketParser {
       }
       const view = new DataView(this.buffer.buffer,this.buffer.byteOffset,this.buffer.byteLength);
       const length = view.getUint16(6,true), kind = this.buffer[4];
-      if (length > 2048 || kind > 2 || this.buffer[5] !== 0) {this.buffer=this.buffer.subarray(1);this.onError(new Error('Invalid Bluetooth header'));continue;}
+      if (length > 4096 || kind > 4 || this.buffer[5] !== 0) {this.buffer=this.buffer.subarray(1);this.onError(new Error('Invalid Bluetooth header'));continue;}
       if (this.buffer.length < length+12) break;
       const payload = this.buffer.slice(12,length+12);
       if (crc32(payload) !== view.getUint32(8,true)) {this.buffer=this.buffer.subarray(1);this.onError(new Error('Bluetooth CRC mismatch'));continue;}

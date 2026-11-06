@@ -8,6 +8,7 @@ import { decodeAudio, LineParser } from '../dashboard/protocol.js';
 import { newSession, renderAudio, wavBytes } from '../dashboard/session.js';
 import { writeSession, readSession } from '../dashboard/hdf5.js';
 import { crc32, BlePacketParser } from '../dashboard/ble-protocol.js';
+import { audioIntegrity } from '../dashboard/audio-timeline.js';
 const {FS} = await h5.ready;
 const temp = mkdtempSync(join(tmpdir(), 'pal-h5-'));
 FS.chdir(temp);
@@ -29,6 +30,15 @@ test('fragmented lines, malformed packet recovery, bounded buffer',()=>{
  for(const c of '{"a":1}\n{broken\n{"b":2}\n')parser.push(c);
  assert.deepEqual(packets,[{a:1},{b:2}]);assert.equal(errors.length,1);
  parser.push('x'.repeat(70000));parser.push('\n{"c":3}\n');assert.deepEqual(packets.at(-1),{c:3});
+});
+test('USB boot diagnostics do not hide malformed JSON or a reboot mid-stream',()=>{
+ const packets=[],errors=[];const parser=new LineParser(p=>packets.push(p),e=>errors.push(e),{usbBootLog:true});
+ parser.push('ESP-ROM:esp32s3-20210327\r\nload:0x3fce3808,len:0x4bc\r\n');
+ parser.push('E (208) esp_core_dump_flash: No core dump partition found!\n{broken\n');
+ parser.push('{"type":"health"}\nESP-ROM:esp32s3-20210327\n');
+ assert.deepEqual(packets,[{type:'health'}]);assert.equal(errors.length,2);
+ const strict=new LineParser(()=>{},e=>errors.push(e));
+ strict.push('ESP-ROM:esp32s3-20210327\n');assert.equal(errors.length,3);
 });
 test('binary Bluetooth preserves samples, 64-bit clocks and IMU axes; CRC recovers after corruption',()=>{
  assert.equal(crc32(new TextEncoder().encode('123456789')),0xcbf43926);
@@ -81,6 +91,14 @@ test('HDF5 compressed round trip preserves sample values, per-frame rates, exact
 test('HDF5 empty and sensor-only sessions round trip',()=>{
  for(const s of [newSession(),{...fixture(),audio:[]}]){const r=readSession(h5,FS,writeSession(h5,FS,s));assert.equal(r.audio.length,0);assert.equal(r.imu.length,s.imu.length);}
 });
+test('48 kHz Bluetooth recording retains actual frame gaps through HDF5 into Explorer',()=>{
+ const s=newSession();
+ s.audio=[0,1,4,5].map(n=>decodeAudio({type:'audio',audio_codec:'ima_adpcm',audio_adpcm_bytes:new Uint8Array(484),audio_rate_hz:48000,audio_samples:960,audio_time_ms:1793896772000+20*n,audio_sample_index:960*n,audio_monotonic_us:1000000+20000*n,sequence:n,stream_id:42,segment:0,capture_dropped_frames:n<4?0:2,clock_synced:true},'ble'));
+ const imported=readSession(h5,FS,writeSession(h5,FS,s));
+ assert.deepEqual(imported.audio.map(f=>f.pcm.length),[960,960,960,960]);
+ assert.deepEqual(audioIntegrity(imported.audio),audioIntegrity(s.audio));
+ assert.equal(audioIntegrity(imported.audio).missingMs,40);assert.equal(audioIntegrity(imported.audio).missingFrames,2);
+});
 test('playback preserves gaps and rate changes; WAV contains PCM',()=>{
  const s=newSession();s.audio=[{time_ms:1000,rate:8000,pcm:new Int16Array(800).fill(16384)},{time_ms:1200,rate:16000,pcm:new Int16Array(1600).fill(-16384)}];
  const r=renderAudio(s,1000,1300);assert.equal(r.pcm.length,4800);assert.equal(r.pcm[50],.5);assert.equal(r.pcm[2400],0);assert.equal(r.pcm[4000],-.5);
@@ -97,4 +115,21 @@ test('kit registry preserves distinct devices and updates a kit after DHCP chang
  assert.deepEqual(loadKits({getItem:()=>'{broken'}),[]);
  const s=fixture();s.device={id:'one',name:'PAL-one'};
  assert.deepEqual(readSession(h5,FS,writeSession(h5,FS,s)).device,s.device);
+});
+
+test('A3 raw audio preserves every signed 32-bit DMA bit, including low bits and extremes',()=>{
+ const values=[-2147483648,-257,-1,0,1,257,2147483647];
+ const data=Buffer.alloc(values.length*4);values.forEach((v,i)=>data.writeInt32LE(v,i*4));
+ const packet={...base,audio_rate_hz:48000,audio_samples:values.length,audio_pcm_s32_b64:data.toString('base64')};
+ const frame=decodeAudio(packet,'usb');assert.ok(frame.pcm instanceof Int32Array);assert.deepEqual([...frame.pcm],values);
+ assert.equal(frame.codec,'i2s_s32le');assert.throws(()=>decodeAudio({...packet,audio_samples:8},'usb'),/Truncated/);
+ const s=fixture();s.configuration={hardware:'FrED PAL A3',audio:{alignment:'unshifted_dma_requires_bench_validation'}};
+ s.audio.unshift(frame);s.imu_raw=[{time_ms:base.audio_time_ms,monotonic_us:123456789,tag:2,x:-32768,y:32767,z:-1,sequence:2,segment:1,stream_id:8,clock_synced:1}];
+ s.health=[{time_ms:base.audio_time_ms,battery_v:4.123,imu_overruns:3}];s.environment[0].gas_ohms=NaN;s.environment[0].gas_valid=false;s.environment[0].heater_stable=false;
+ const bytes=writeSession(h5,FS,s),r=readSession(h5,FS,bytes);
+ assert.deepEqual(r.configuration,s.configuration);assert.deepEqual(r.imu_raw,s.imu_raw);
+ assert.deepEqual(r.audio.map(f=>[...f.pcm]),s.audio.map(f=>[...f.pcm]));assert.ok(r.audio[0].pcm instanceof Int32Array);assert.ok(r.audio[1].pcm instanceof Int16Array);
+ assert.equal(r.health[0].imu_overruns,3);assert.equal(r.health[0].battery_v,4.123);assert.ok(Number.isNaN(r.environment[0].gas_ohms));assert.equal(r.environment[0].gas_valid,0);
+ const playback=renderAudio({...newSession(),audio:[{time_ms:0,rate:48000,pcm:new Int32Array(480).fill(1073741824)}]},0,10,48000);nearHalf(playback.pcm[10]);
+ function nearHalf(v) {assert.equal(v,.5);}
 });

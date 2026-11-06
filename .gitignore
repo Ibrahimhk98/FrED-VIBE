@@ -8,3 +8,4 @@ node_modules/
 dashboard/vendor/
 .venv-usb/
 __pycache__/
+firmware/

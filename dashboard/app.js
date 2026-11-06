@@ -1,3 +1,9 @@
+import { Orientation, ImuPreview } from './orientation.js';
+import { DeviceView } from './device-view.js';
+import { audioEnvelope, audioIntegrity } from './audio-timeline.js';
+import { setupFirmwarePanel } from './firmware.js';
+import { setupSamplingPanel } from './sampling.js';
+import { setupDeviceDialog } from './setup.js';
 import { decodeAudio, LineParser } from './protocol.js';
 import { BlePacketParser } from './ble-protocol.js';
 import { newSession, sessionCount, MAX_RECORDING_BYTES, ENV_FIELDS, IMU_FIELDS } from './session.js';
@@ -6,8 +12,39 @@ import { loadKits, rememberKit, validHost, availableKits, KIT_STORAGE_KEY } from
 import { createExplorerWindow } from './workspace.js';
 import { loadRecordingFolder, rememberRecordingFolder, ensureFolderWritePermission, recordingFilename, writeRecordingFile } from './recording-location.js';
 const $ = id => document.getElementById(id);
+const setupDialog=setupDeviceDialog();
+const orientation = new Orientation(), imuPreview = new ImuPreview(), deviceView = new DeviceView($('deviceRender'));
+let lastMotionAt = -Infinity, motionKey = '';
+function resetMotion() {orientation.reset();imuPreview.reset();lastMotionAt=-Infinity;motionKey='';}
+$('trimOrientation').onclick = () => {
+  if(performance.now()-lastMotionAt>=1500)return;
+  orientation.cancelTrim();$('trimProgress').textContent='Place the board flat before starting.';$('trimDialog').showModal();
+};
+$('startTrim').onclick = () => {if(performance.now()-lastMotionAt<1500)orientation.beginTrim();};
+$('cancelTrim').onclick = () => {orientation.cancelTrim();$('trimDialog').close();};
+$('trimDialog').addEventListener('cancel',()=>orientation.cancelTrim());
+$('resetOrientation').onclick = () => orientation.clearTrim();
+let lastRenderAt=0;
+function renderDevice(now) {
+  if(now-lastRenderAt>=32) {
+    const live=!!active && now-lastMotionAt<1500;
+    deviceView.draw(orientation.pose,live);
+    $('trimOrientation').disabled=!live || !orientation.ready || orientation.calibrating;
+    $('resetOrientation').disabled=!orientation.trimmed;
+    $('startTrim').disabled=!live || orientation.calibrating;
+    if($('trimDialog').open && orientation.calibrating) $('trimProgress').textContent=!live ? 'Waiting for fresh motion samples…' : orientation.trimState.phase==='moving' ? 'Movement detected. Keep the board still on the flat surface.' : `Keep still… ${Math.round(orientation.trimState.progress*100)}%`;
+    if($('trimDialog').open && orientation.trimState.phase==='complete') {$('trimDialog').close();status('Flat-surface trim complete. World Z is up; heading is relative.');}
+    $('orientationState').textContent=live ? (orientation.calibrating?'Calibrating · keep the board flat and still':orientation.trimmed?'Live · flat-surface calibrated · Z up':'Live · gravity reference · place flat and trim') : orientation.ready?'Motion paused · no recent samples':'Waiting for motion data';
+    const angles=orientation.angles;
+    ['Roll','Pitch','Yaw'].forEach((name,i)=>$('pose'+name).textContent=orientation.ready?`${angles[i].toFixed(1)}°`:'—');
+    lastRenderAt=now;
+  }
+  requestAnimationFrame(renderDevice);
+}
+requestAnimationFrame(renderDevice);
 const SERVICE = '7f510001-5b8d-4a84-9c7c-a07142ab6002', DATA = '7f510002-5b8d-4a84-9c7c-a07142ab6002', COMMAND = '7f510003-5b8d-4a84-9c7c-a07142ab6002';
 let active, connecting = false, handoff = false, handoffTimer, recording = false, session = newSession();
+let firmwareBusy=false, firmwarePanel, samplingBusy=false, samplingPanel;
 let previousFrame, missingFrames = 0, malformed = 0, lastAudioAt = 0, lastFrame, exporting = false, unsaved = false;
 let commandChain = Promise.resolve();
 let recordingFolder = null, folderBusy = true;
@@ -18,11 +55,13 @@ let kits = loadKits(kitStorage);
 let discoveredKits = [], discovering = false, renderedKitState = '';
 const allKits = () => availableKits(kits, discoveredKits);
 const histories = {accel:[], gyro:[]};
-let waveSamples = [], liveRate = 16000;
+let waveFrames = [];
 function status(message) { $('status').textContent = message; $('pulseDot').className = `pulse-dot ${recording ? 'recording' : active ? 'connected' : ''}`; }
 function controls() {
-  for (const id of ['usb','usbBridge','ble','wifiConnect']) $(id).disabled = connecting;
-  $('record').disabled = recording || !active?.deviceIdentity || exporting;
+  for (const id of ['usb','usbBridge','ble','wifiConnect']) $(id).disabled = connecting || firmwareBusy;
+  $('disconnectBtn').disabled=firmwareBusy || !active;
+  $('openSetup').textContent=active?'Device settings':'Connect / device setup';
+  $('record').disabled = recording || !active?.deviceIdentity || exporting || firmwareBusy || samplingBusy;
   $('stop').disabled = !recording;
   $('clock').disabled = !active || recording;
   $('wifiEnable').disabled = !active || active.kind === 'ws' || handoff;
@@ -32,6 +71,8 @@ function controls() {
   $('useDownloads').disabled = !recordingFolder || folderBusy || exporting;
   $('clear').disabled = recording || exporting;
   $('recCounter').style.display = recording ? 'inline-flex' : 'none';
+  firmwarePanel?.render();
+  samplingPanel?.render();
 }
 function recordSize(bytes) {
   unsaved = true;
@@ -58,7 +99,13 @@ function packet(data, channel) {
     if (channel.kind === 'ws' && !channel.remembered) {saveKit(identity, channel.host);channel.remembered=true;}
     if (data.state === 'wifi_connected' && data.ip) saveKit(identity, data.ip);
   }
-  if (Number.isFinite(data.time_ms)) {
+  if (data.type === 'configuration') {
+    channel.configuration = data;
+    if(recording) {session.configuration=structuredClone(data);recordSize(JSON.stringify(data).length);}
+  }
+  if (data.clock_synced === false) {
+    $('deviceTime').textContent='Time not synchronized';$('clockDrift').textContent='Sync RTC to PC before recording UTC timestamps';
+  } else if (Number.isFinite(data.time_ms) && data.time_ms > 1577836800000) {
     $('deviceTime').textContent = new Date(data.time_ms).toLocaleTimeString([], {hour12:false});
     $('clockDrift').textContent = `Clock offset vs PC: ${((Date.now() - data.time_ms) / 1000).toFixed(2)} s`;
   }
@@ -73,10 +120,29 @@ function packet(data, channel) {
     if (!(data.state === 'wifi_connected' && connecting)) status(`${data.state}: ${data.detail || data.ip || ''}`);
     return;
   }
+  if (data.type === 'health') {
+    if(channel.kind==='ble')$('radioHealth').textContent=`Bluetooth interval ${data.ble_interval_ms??'unknown'} ms · notification payload ${data.ble_att_payload??'unknown'} bytes · transmit retries ${data.ble_notify_retries??'unknown'} · audio queue high-water ${data.audio_queue_high_water??'unknown'} frames · failed Bluetooth messages ${data.ble_dropped??0}`;
+    if(Number.isFinite(data.battery_v)) {$('batVal').textContent=`${data.battery_v.toFixed(3)} V`;$('batStatus').textContent='J2 BAT+ terminal · measured through GPIO1';}
+    $('sensorHealth').textContent=`IMU ${data.imu_ready?'ready':'unavailable'} · environment ${data.bme_ready?'ready':'unavailable'} · microphone ${data.mic_ready?'ready':'unavailable'} · IMU overruns ${data.imu_overruns??0} · telemetry drops ${data.telemetry_dropped??0}`;
+    if(recording) {session.health.push(data);recordSize(1024);}
+  }
+  if (data.type === 'telemetry' && Array.isArray(data.imu_raw)) {
+    const {raw,pairs,key}=imuPreview.consume(data);
+    if(key!==motionKey) {orientation.reset();motionKey=key;}
+    for(const pair of pairs) {
+      if(orientation.update(pair.accel,pair.gyro,pair.monotonic_us/1000)) lastMotionAt=performance.now();
+      histories.accel.push(pair.accel);histories.gyro.push(pair.gyro);
+      const values=[...pair.accel,...pair.gyro];
+      ['Ax','Ay','Az','Gx','Gy','Gz'].forEach((id,i)=>$('val'+id).textContent=values[i].toFixed(2));
+      if(recording) {session.imu.push(Object.fromEntries([['time_ms',pair.time_ms],...IMU_FIELDS.map((f,i)=>[f,values[i]])]));recordSize(128);}
+    }
+    if(recording) {session.imu_raw.push(...raw);recordSize(raw.length*160);}
+    histories.accel=histories.accel.slice(-300);histories.gyro=histories.gyro.slice(-300);
+  }
   if (data.type === 'environment') {
     showEnv(data);
     if (recording) {
-      session.environment.push(Object.fromEntries(['time_ms', ...ENV_FIELDS].map(f => [f, Number(data[f])])));
+      session.environment.push({...data,...Object.fromEntries(['time_ms', ...ENV_FIELDS].map(f => [f, data[f]==null ? NaN : Number(data[f])]))});
       recordSize(160);
     }
   }
@@ -95,19 +161,19 @@ function packet(data, channel) {
   }
   if (data.type === 'audio') {
     const frame = decodeAudio(data, channel.kind === 'bridge' ? 'usb' : channel.kind);
+    // Store the decoded frame before preview work; plotting never gates recording.
+    if (recording) { session.audio.push(frame); recordSize(frame.pcm.byteLength + 256); }
     if (previousFrame && frame.stream_id === previousFrame.stream_id && frame.sequence > previousFrame.sequence)
       missingFrames += Math.max(0, frame.sequence - previousFrame.sequence - 1);
-    previousFrame = frame; lastFrame = frame; lastAudioAt = performance.now(); liveRate = frame.rate;
-    for (const sample of frame.pcm) waveSamples.push(sample / 32768);
-    waveSamples = waveSamples.slice(-Math.round(liveRate / 2));
-    $('audioValue').textContent = `${frame.dbfs.toFixed(1)} dBFS · ${frame.rate / 1000} kHz`;
-    if (recording) { session.audio.push(frame); recordSize(frame.pcm.byteLength + 256); }
+    previousFrame = frame; lastFrame = frame; lastAudioAt = performance.now();
+    waveFrames.push(frame);
+    waveFrames=waveFrames.filter(f=>f.stream_id===frame.stream_id && f.time_ms+f.pcm.length*1000/f.rate>frame.time_ms-500).slice(-64);
   }
   controls();
 }
 function makeChannel(kind) {
   const channel = {kind, closing:false};
-  channel.parser = new LineParser(data => packet(data, channel), () => { malformed++; if (recording) session.malformed++; });
+  channel.parser = new LineParser(data => packet(data, channel), () => { malformed++; if (recording) session.malformed++; }, {usbBootLog:kind === 'usb' || kind === 'bridge'});
   return channel;
 }
 function lost(channel, message) {
@@ -140,11 +206,13 @@ async function activate(channel) {
   const old = active;
   if (recording && !handoff) stopRecording();
   active = channel;
+  resetMotion();
   missingFrames = 0; malformed = 0; lastFrame = undefined;
-  previousFrame = undefined; waveSamples = []; lastAudioAt = performance.now();
+  previousFrame = undefined; waveFrames = []; lastAudioAt = performance.now();
   handoff = false; clearTimeout(handoffTimer);
   await closeChannel(old);
   status(`Connected via ${{usb:'USB',bridge:'USB bridge',ble:'Bluetooth',ws:'Wi-Fi'}[channel.kind]}`); controls();
+  setupDialog.connected();
 }
 async function connectUsb() {
   if (!navigator.serial) { status('Web Serial requires Chrome or Edge on localhost.'); return; }
@@ -167,6 +235,7 @@ async function connectUsb() {
       } catch (e) { if (!channel.closing) status(`USB: ${e.message}`); }
       finally { channel.reader.releaseLock(); if (!channel.closing) { lost(channel, 'USB disconnected. Recording stopped.'); closeChannel(channel); } }
     })();
+    await sendCommand({cmd:'get_config'});
   } catch (e) { if (channel) await closeChannel(channel); status(`USB: ${e.message}`); }
   finally { connecting = false; controls(); }
 }
@@ -186,7 +255,9 @@ async function connectBle() {
     channel.parser = new BlePacketParser(data => packet(data,channel), () => {malformed++; if(recording)session.malformed++;});
     channel.data.addEventListener('characteristicvaluechanged', e => channel.parser.push(e.target.value));
     await activate(channel); await channel.data.startNotifications();
-    await sendCommand({cmd:'wifi_status'});
+    // The subscription's first notification can arrive before the central has
+    // completed CCCD setup. Request configuration after notifications are ready.
+    await sendCommand({cmd:'get_config'});
   } catch (e) { if (channel) { if (active === channel) active = null; await closeChannel(channel); } status(`Bluetooth: ${e.message}`); }
   finally { connecting = false; controls(); }
 }
@@ -209,6 +280,7 @@ async function connectWifi(host = $('wifiHost').value.trim(), bridge = false) {
     socket.onclose = () => lost(channel, bridge ? 'USB bridge disconnected. Check the cable and local bridge.' : 'Wi-Fi disconnected. Reconnect by IP or Bluetooth.');
     socket.onerror = () => status(bridge ? 'USB bridge connection error' : 'Wi-Fi connection error');
     await activate(channel);
+    await sendCommand({cmd:'get_config'});
   } catch (e) {
     channel.socket?.close(); handoff = false; clearTimeout(handoffTimer);
     if (!active && recording) stopRecording();
@@ -225,7 +297,7 @@ function sendCommand(command) {
     if (!channel || channel !== active) throw new Error('Connect a device first');
     const payload = new TextEncoder().encode(JSON.stringify(command) + '\n');
     if (payload.length > 768) throw new Error('Command too long');
-    const expected = {set_time:['clock_set'], wifi_on:['wifi_connecting'], wifi_status:['wifi_status','wifi_connected']}[command.cmd];
+    const expected = {set_sampling:['sampling_applied'],set_time:['clock_set'], wifi_on:['wifi_connecting'], wifi_status:['wifi_status','wifi_connected']}[command.cmd];
     let acknowledge, failure;
     const confirmed = expected ? new Promise((resolve, reject) => {acknowledge=resolve; failure=reject;}) : Promise.resolve();
     // Install before writing: the device may respond before the final ATT ACK.
@@ -250,13 +322,14 @@ function sendCommand(command) {
   }); return result;
 }
 function startRecording() {
-  if (!active) return;
+  if (!active || firmwareBusy || samplingBusy) return;
   if (sessionCount(session) && !confirm('Start a new recording? Export the current session first if you want to keep it.')) return;
-  session = newSession(); session.device = {...active.deviceIdentity}; recording = true; unsaved = true; controls(); status('Recording acoustic samples, motion and environment');
+  session = newSession(); session.device = {...active.deviceIdentity}; session.configuration = active.configuration ? structuredClone(active.configuration) : null; recording = true; unsaved = true; controls(); status('Recording acoustic samples, motion and environment');
 }
 function stopRecording() {
   recording = false; session.ended = Date.now(); controls();
-  status(`Recording stopped: ${session.audio.length} audio frames · ${session.imu.length} IMU samples · ${session.environment.length} environmental readings`);
+  const integrity=audioIntegrity(session.audio);
+  status(`Recording stopped: ${session.audio.length} audio frames · ${integrity.missingFrames} missing audio frames (${(integrity.missingMs/1000).toFixed(3)} s) · ${session.imu.length} IMU samples · ${session.environment.length} environmental readings`);
 }
 function renderKits(selected = $('kitSelect').value) {
   const state = JSON.stringify([selected, allKits().map(({id,name,host,addresses,discovered}) => ({id,name,host,addresses,discovered})), kits.map(k=>k.id)]);
@@ -401,113 +474,42 @@ const openExplorer = createExplorerWindow(window, () => session, () => ({
 $('explore').onclick = openExplorer;
 $('exploreNav').onclick = event => {event.preventDefault(); openExplorer();};
 $('liveNav').onclick = event => event.preventDefault();
-window.addEventListener('beforeunload', event => { if (active || recording || (unsaved && sessionCount(session))) {event.preventDefault(); event.returnValue = '';} });
+window.addEventListener('beforeunload', event => { if (firmwareBusy || active || recording || (unsaved && sessionCount(session))) {event.preventDefault(); event.returnValue = '';} });
 if (!navigator.serial || !navigator.bluetooth) $('browserBanner').style.display = 'block';
+samplingPanel=setupSamplingPanel({getState:()=>({active,recording,firmwareBusy}),sendCommand,onBusy:value=>{samplingBusy=value;controls();}});
+firmwarePanel=setupFirmwarePanel({getState:()=>({active,recording,exporting,connecting:connecting||samplingBusy}),sendCommand,disconnect,onBusy:value=>{firmwareBusy=value;controls();}});
 controls();
 setInterval(() => {
   draw('accel'); draw('gyro'); drawAudio();
   if (recording) $('recCounterText').textContent = `${Math.floor((Date.now()-session.started)/1000)}s · ${(session.bytes / 1048576).toFixed(1)} MB`;
   if (active && performance.now() - lastAudioAt > 3000) $('streamHealth').textContent = 'No recent audio frames. Check microphone wiring and device status.';
-  else if (lastFrame) $('streamHealth').textContent = `${lastFrame.rate.toLocaleString()} samples/s · ${lastFrame.codec} · ${missingFrames} missing frames · ${lastFrame.dropped} capture queue drops · ${lastFrame.overruns} DMA overruns · ${malformed} malformed packets${lastFrame.clock_synced ? '' : ' · RTC needs synchronization'}`;
+  else if (lastFrame) $('streamHealth').textContent = `${lastFrame.rate.toLocaleString()} samples/s · ${lastFrame.codec} · Since connection: ${missingFrames} missing frames, ${malformed} malformed packets · Since boot: ${lastFrame.dropped} capture queue drops, ${lastFrame.overruns} DMA overruns${lastFrame.clock_synced ? '' : ' · RTC needs synchronization'}`;
 }, 200);
 function drawAudio() {
-  const canvas = $('audio'), ctx = canvas.getContext('2d');
-  const w = canvas.width = canvas.clientWidth * devicePixelRatio, h = canvas.height = canvas.clientHeight * devicePixelRatio;
-  let low = Infinity, high = -Infinity; for (const v of waveSamples) { low = Math.min(low,v); high = Math.max(high,v); }
-  if (!Number.isFinite(low)) { low = -.0001; high = .0001; }
-  if (high-low < .0001) {low -= .00005; high += .00005;}
-  const center = (low+high)/2, peak = (high-low)/2;
-  $('audioAxis').textContent = `Last ${(waveSamples.length/liveRate).toFixed(2)} s · amplitude ${low.toFixed(4)} to ${high.toFixed(4)} full scale (auto-scaled)`;
-  ctx.strokeStyle = '#334155'; ctx.beginPath(); ctx.moveTo(0,h/2); ctx.lineTo(w,h/2); ctx.stroke();
-  ctx.strokeStyle = '#38bdf8'; ctx.beginPath();
-  for (let x=0; x<w; x++) {
-    const a = Math.floor(x * waveSamples.length/w), b = Math.max(a+1, Math.floor((x+1)*waveSamples.length/w));
-    let lo=1, hi=-1; for(let i=a;i<b && i<waveSamples.length;i++){lo=Math.min(lo,waveSamples[i]);hi=Math.max(hi,waveSamples[i]);}
-    if (a < waveSamples.length) {ctx.moveTo(x,h/2-(hi-center)/peak*h*.44);ctx.lineTo(x,h/2-(lo-center)/peak*h*.44);}
+  const canvas=$('audio'),ctx=canvas.getContext('2d'),dpr=Math.min(devicePixelRatio||1,2);
+  const w=canvas.width=Math.max(1,Math.round(canvas.clientWidth*dpr)),h=canvas.height=canvas.clientHeight*dpr;
+  const latest=waveFrames.at(-1),end=latest ? latest.time_ms+latest.pcm.length*1000/latest.rate : 500;
+  const envelope=audioEnvelope(waveFrames,end-500,end,w);
+  let low=envelope.minimum,high=envelope.maximum;
+  if(!Number.isFinite(low)){low=-.0001;high=.0001;}
+  if(high-low<.0001){low-=.00005;high+=.00005;}
+  const center=(low+high)/2,peak=(high-low)/2;
+  $('audioAxis').textContent=`Last 0.50 s of acquisition time · blank intervals are missing data · amplitude ${low.toFixed(4)} to ${high.toFixed(4)} full scale`;
+  if(latest)$('audioValue').textContent=`${latest.dbfs.toFixed(1)} dBFS · ${latest.rate/1000} kHz`;
+  ctx.strokeStyle='#334155';ctx.beginPath();ctx.moveTo(0,h/2);ctx.lineTo(w,h/2);ctx.stroke();
+  ctx.strokeStyle='#38bdf8';ctx.beginPath();
+  for(let x=0;x<w;x++)if(Number.isFinite(envelope.low[x])) {
+    const top=h/2-(envelope.high[x]-center)/peak*h*.44,bottom=h/2-(envelope.low[x]-center)/peak*h*.44;
+    ctx.moveTo(x,top);ctx.lineTo(x,Math.max(top+.5,bottom));
   }
   ctx.stroke();
 }
-    function showEnv(d) {
-      document.querySelector('#envTemp').textContent = `${d.temperature_c.toFixed(1)} °C`;
-      document.querySelector('#envHum').textContent = `${d.humidity_pct.toFixed(1)} %`;
-      document.querySelector('#envPress').textContent = `${d.pressure_hpa.toFixed(1)} hPa`;
-      document.querySelector('#envGas').textContent = `${Number(d.gas_ohms).toLocaleString()} Ω`;
-
-      if (d.iaq !== undefined) {
-        const iaq = Number(d.iaq);
-        const voc = Number(d.voc_ppm).toFixed(2);
-        const eco2 = Math.round(Number(d.eco2_ppm));
-
-        const iaqValEl = document.querySelector('#iaqVal');
-        const vocValEl = document.querySelector('#vocVal');
-        const eco2ValEl = document.querySelector('#eco2Val');
-        const iaqBadgeEl = document.querySelector('#iaqBadge');
-        const iaqStatusTextEl = document.querySelector('#iaqStatusText');
-
-        if (iaqValEl) iaqValEl.textContent = iaq.toFixed(1);
-        if (vocValEl) vocValEl.textContent = `${voc} ppm`;
-        if (eco2ValEl) eco2ValEl.textContent = `${eco2} ppm`;
-
-        if (iaq <= 50) {
-          if (iaqBadgeEl) {
-            iaqBadgeEl.textContent = '🟢 Good (0-50)';
-            iaqBadgeEl.style.background = 'rgba(52, 211, 153, 0.15)';
-            iaqBadgeEl.style.color = '#34d399';
-            iaqBadgeEl.style.borderColor = 'rgba(52, 211, 153, 0.3)';
-          }
-          if (iaqValEl) iaqValEl.style.color = '#34d399';
-          if (iaqStatusTextEl) { iaqStatusTextEl.textContent = 'Good Air Quality'; iaqStatusTextEl.style.color = '#34d399'; }
-        } else if (iaq <= 100) {
-          if (iaqBadgeEl) {
-            iaqBadgeEl.textContent = '🟡 Moderate (51-100)';
-            iaqBadgeEl.style.background = 'rgba(251, 191, 36, 0.15)';
-            iaqBadgeEl.style.color = '#fbbf24';
-            iaqBadgeEl.style.borderColor = 'rgba(251, 191, 36, 0.3)';
-          }
-          if (iaqValEl) iaqValEl.style.color = '#fbbf24';
-          if (iaqStatusTextEl) { iaqStatusTextEl.textContent = 'Moderate Air Quality'; iaqStatusTextEl.style.color = '#fbbf24'; }
-        } else if (iaq <= 200) {
-          if (iaqBadgeEl) {
-            iaqBadgeEl.textContent = '🟠 Poor (101-200)';
-            iaqBadgeEl.style.background = 'rgba(249, 115, 22, 0.15)';
-            iaqBadgeEl.style.color = '#f97316';
-            iaqBadgeEl.style.borderColor = 'rgba(249, 115, 22, 0.3)';
-          }
-          if (iaqValEl) iaqValEl.style.color = '#f97316';
-          if (iaqStatusTextEl) { iaqStatusTextEl.textContent = 'Poor Air Quality'; iaqStatusTextEl.style.color = '#f97316'; }
-        } else {
-          if (iaqBadgeEl) {
-            iaqBadgeEl.textContent = '🔴 Hazardous (201+)';
-            iaqBadgeEl.style.background = 'rgba(244, 63, 94, 0.15)';
-            iaqBadgeEl.style.color = '#f43f5e';
-            iaqBadgeEl.style.borderColor = 'rgba(244, 63, 94, 0.3)';
-          }
-          if (iaqValEl) iaqValEl.style.color = '#f43f5e';
-          if (iaqStatusTextEl) { iaqStatusTextEl.textContent = 'Hazardous Air!'; iaqStatusTextEl.style.color = '#f43f5e'; }
-        }
-      }
-
-      if (d.battery_v !== undefined) {
-        const v = Number(d.battery_v).toFixed(2);
-        const pct = Number(d.battery_pct);
-        const batEl = document.querySelector('#batVal');
-        const batStat = document.querySelector('#batStatus');
-
-        if (batEl && batStat) {
-          batEl.textContent = `🔋 ${v} V (${pct}%)`;
-          if (pct >= 50) {
-            batEl.style.color = 'var(--accent-green)';
-            batStat.textContent = '🔋 Battery Level Normal';
-          } else if (pct >= 20) {
-            batEl.style.color = 'var(--accent-amber)';
-            batStat.textContent = '🟡 Battery Level Moderate';
-          } else {
-            batEl.style.color = 'var(--accent-rose)';
-            batStat.textContent = '🔴 Battery Low - Recharge Soon';
-          }
-        }
-      }
-    }
+function showEnv(d) {
+  for(const [id,field,unit] of [['envTemp','temperature_c','°C'],['envHum','humidity_pct','%'],['envPress','pressure_hpa','hPa'],['envGas','gas_ohms','Ω']]) {
+    $(id).textContent=Number.isFinite(d[field]) ? `${d[field].toLocaleString(undefined,{maximumFractionDigits:2})} ${unit}`:'Unavailable';
+  }
+  $('gasValidity').textContent=d.gas_valid && d.heater_stable ? 'New reading · gas valid · heater stable' : 'Gas unavailable until a valid, heater-stable measurement';
+}
 
     function draw(key) {
       const canvas = document.querySelector('#' + key), values = histories[key], ctx = canvas.getContext('2d');

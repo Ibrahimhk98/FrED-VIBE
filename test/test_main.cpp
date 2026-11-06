@@ -5,6 +5,10 @@
 #include <cstdint>
 #include "ima_adpcm.h"
 #include "ble_packet.h"
+#include "ble_imu.h"
+#include "ble_stream.h"
+#include "ble_audio_filter.h"
+#include "board_a3.h"
 
 static inline int32_t constrainVal(int32_t val, int32_t minVal, int32_t maxVal) {
   return val < minVal ? minVal : (val > maxVal ? maxVal : val);
@@ -65,112 +69,10 @@ void test_dbfs_calculation() {
 }
 
 
-uint8_t calculateBatteryPercentageTest(float vBat) {
-  if (vBat >= 4.20f) return 100;
-  if (vBat <= 3.30f) return 0;
-  float pct = (vBat - 3.30f) / (4.20f - 3.30f) * 100.0f;
-  return static_cast<uint8_t>(pct < 0.0f ? 0.0f : (pct > 100.0f ? 100.0f : pct));
-}
-
-void test_battery_percentage() {
-  TEST_ASSERT_EQUAL_UINT8(100, calculateBatteryPercentageTest(4.20f));
-  TEST_ASSERT_EQUAL_UINT8(100, calculateBatteryPercentageTest(4.35f));
-  TEST_ASSERT_EQUAL_UINT8(50, calculateBatteryPercentageTest(3.75f));
-  TEST_ASSERT_EQUAL_UINT8(0, calculateBatteryPercentageTest(3.30f));
-  TEST_ASSERT_EQUAL_UINT8(0, calculateBatteryPercentageTest(2.80f));
-}
-
-enum SystemStatusColorTest {
-  COLOR_BLUE,   // BLE Connected
-  COLOR_RED,    // Sensor Error or High Gas Alert
-  COLOR_AMBER,  // RTC Drift / Low Battery
-  COLOR_GREEN   // All Systems Normal
-};
-
-SystemStatusColorTest evaluateSystemStatusTest(bool bleConn, bool rtcOk, bool rtcSyncNeeded, bool imuOk, bool bmeOk, bool micOk, float vBat, uint32_t gasOhms) {
-  if (bleConn) return COLOR_BLUE;
-  if (!rtcOk || !imuOk || !bmeOk || !micOk || (bmeOk && gasOhms > 0 && gasOhms < 20000)) return COLOR_RED;
-  if (rtcSyncNeeded || (vBat > 0.5f && vBat < 3.48f)) return COLOR_AMBER;
-  return COLOR_GREEN;
-}
-
-void test_neopixel_status_priority() {
-  // BLE connected -> BLUE
-  TEST_ASSERT_EQUAL_INT(COLOR_BLUE, evaluateSystemStatusTest(true, true, false, true, true, true, 4.1f, 100000));
-  // Sensor error -> RED
-  TEST_ASSERT_EQUAL_INT(COLOR_RED, evaluateSystemStatusTest(false, false, false, true, true, true, 4.1f, 100000));
-  // High gas hazard / drop -> RED
-  TEST_ASSERT_EQUAL_INT(COLOR_RED, evaluateSystemStatusTest(false, true, false, true, true, true, 4.1f, 15000));
-  // RTC sync needed -> AMBER
-  TEST_ASSERT_EQUAL_INT(COLOR_AMBER, evaluateSystemStatusTest(false, true, true, true, true, true, 4.1f, 100000));
-  // Low battery -> AMBER
-  TEST_ASSERT_EQUAL_INT(COLOR_AMBER, evaluateSystemStatusTest(false, true, false, true, true, true, 3.4f, 100000));
-  // All normal -> GREEN
-  TEST_ASSERT_EQUAL_INT(COLOR_GREEN, evaluateSystemStatusTest(false, true, false, true, true, true, 4.0f, 100000));
-}
-
-float computePulseFactorTest(uint32_t ms) {
-  const uint32_t phase = ms % 5000;
-  constexpr uint32_t PULSE_DURATION_MS = 600;
-  if (phase < PULSE_DURATION_MS) {
-    return sinf((static_cast<float>(phase) / static_cast<float>(PULSE_DURATION_MS)) * 3.14159265f);
-  }
-  return 0.0f;
-}
-
-void test_battery_save_pulse_math() {
-  TEST_ASSERT_FLOAT_WITHIN(0.05f, 1.0f, computePulseFactorTest(300));
-  TEST_ASSERT_EQUAL_FLOAT(0.0f, computePulseFactorTest(1000));
-  TEST_ASSERT_FLOAT_WITHIN(0.05f, 1.0f, computePulseFactorTest(5300));
-}
-
-struct UnpackedImuWordTest {
-  uint8_t tag;
-  int16_t rawX, rawY, rawZ;
-  float axG, ayG, azG;
-  float gxRads, gyRads, gzRads;
-};
-
-UnpackedImuWordTest unpackImuFifoWordTest(const uint8_t rawBytes[7]) {
-  UnpackedImuWordTest result = {};
-  result.tag = rawBytes[0] >> 3;
-  result.rawX = static_cast<int16_t>(rawBytes[1] | (rawBytes[2] << 8));
-  result.rawY = static_cast<int16_t>(rawBytes[3] | (rawBytes[4] << 8));
-  result.rawZ = static_cast<int16_t>(rawBytes[5] | (rawBytes[6] << 8));
-
-  if (result.tag == 0x02) { // Accel tag
-    constexpr float accelScaleG = 0.000122f; // 0.122 mg/LSB for 4G range
-    result.axG = static_cast<float>(result.rawX) * accelScaleG;
-    result.ayG = static_cast<float>(result.rawY) * accelScaleG;
-    result.azG = static_cast<float>(result.rawZ) * accelScaleG;
-  } else if (result.tag == 0x01) { // Gyro tag
-    constexpr float gyroScaleRads = 17.50f * (3.14159265f / 180.0f) / 1000.0f; // 17.50 mdps/LSB for 500 dps range
-    result.gxRads = static_cast<float>(result.rawX) * gyroScaleRads;
-    result.gyRads = static_cast<float>(result.rawY) * gyroScaleRads;
-    result.gzRads = static_cast<float>(result.rawZ) * gyroScaleRads;
-  }
-  return result;
-}
-
-void test_imu_fifo_unpacking() {
-  // Test Accel FIFO word tag (0x02 << 3 = 0x10) with raw 1.0g (8196 LSB) on X axis
-  const uint8_t accelWord[7] = { 0x10, 0x04, 0x20, 0x00, 0x00, 0xFC, 0xDF };
-  UnpackedImuWordTest accelRes = unpackImuFifoWordTest(accelWord);
-
-  TEST_ASSERT_EQUAL_UINT8(0x02, accelRes.tag);
-  TEST_ASSERT_EQUAL_INT16(8196, accelRes.rawX);
-  TEST_ASSERT_EQUAL_INT16(0, accelRes.rawY);
-  TEST_ASSERT_EQUAL_INT16(-8196, accelRes.rawZ);
-  TEST_ASSERT_FLOAT_WITHIN(0.01f, 1.00f, accelRes.axG);
-  TEST_ASSERT_FLOAT_WITHIN(0.01f, -1.00f, accelRes.azG);
-
-  // Test Gyro FIFO word tag (0x01 << 3 = 0x08) with raw 1000 LSB on X axis
-  const uint8_t gyroWord[7] = { 0x08, 0xE8, 0x03, 0x00, 0x00, 0x00, 0x00 };
-  UnpackedImuWordTest gyroRes = unpackImuFifoWordTest(gyroWord);
-
-  TEST_ASSERT_EQUAL_UINT8(0x01, gyroRes.tag);
-  TEST_ASSERT_EQUAL_INT16(1000, gyroRes.rawX);
-  TEST_ASSERT_FLOAT_WITHIN(0.001f, 0.3054f, gyroRes.gxRads);
+void test_a3_calibrated_battery_conversion() {
+  TEST_ASSERT_FLOAT_WITHIN(0.005f, 4.2f, FredPal::batteryVolts(1042));
+  TEST_ASSERT_FLOAT_WITHIN(0.005f, 3.7f, FredPal::batteryVolts(918));
+  TEST_ASSERT_EQUAL_FLOAT(0.0f, FredPal::batteryVolts(0));
 }
 
 void test_adpcm_encoder_decoder_roundtrip() {
@@ -220,75 +122,6 @@ void test_adpcm_encoder_decoder_roundtrip() {
   TEST_ASSERT_TRUE(snrDb > 15.0);
 }
 
-struct IaqResultTest {
-  float iaq;
-  float vocPpm;
-  float eco2Ppm;
-};
-
-IaqResultTest calculateIaqScoreTest(float tempC, float humPct, uint32_t gasOhms) {
-  if (gasOhms == 0) {
-    return {0.0f, 0.0f, 400.0f};
-  }
-
-  // 1. Humidity Contribution (25% weight)
-  float sHum = 0.0f;
-  if (humPct >= 38.0f && humPct <= 42.0f) {
-    sHum = 25.0f;
-  } else if (humPct < 38.0f) {
-    sHum = (0.25f / 40.0f) * humPct * 100.0f;
-  } else {
-    sHum = ((-0.25f / 60.0f) * humPct + 0.4166f) * 100.0f;
-  }
-
-  // 2. Gas Resistance Contribution (75% weight)
-  float rGas = static_cast<float>(gasOhms);
-  constexpr float R_UPPER = 50000.0f; // Good air
-  constexpr float R_LOWER = 5000.0f;  // Bad air
-  if (rGas > R_UPPER) rGas = R_UPPER;
-  if (rGas < R_LOWER) rGas = R_LOWER;
-
-  float sGas = ((0.75f / (R_UPPER - R_LOWER)) * rGas - (R_LOWER * (0.75f / (R_UPPER - R_LOWER)))) * 100.0f;
-
-  // 3. IAQ Score and VOC estimation
-  float iaqPct = sHum + sGas;
-  float rawIaq = (100.0f - iaqPct) * 5.0f;
-  if (rawIaq < 0.0f) rawIaq = 0.0f;
-  if (rawIaq > 500.0f) rawIaq = 500.0f;
-
-  const float vocPpm = (rawIaq / 500.0f) * 10.0f;
-  const float eco2Ppm = 400.0f + (rawIaq * 8.0f);
-
-  return {rawIaq, vocPpm, eco2Ppm};
-}
-
-void test_iaq_calculation() {
-  // Test 1: Clean baseline air at 40% RH, 50,000 Ω -> IAQ 0, VOC 0.0 ppm, eCO2 400 ppm
-  IaqResultTest resClean = calculateIaqScoreTest(25.0f, 40.0f, 50000);
-  TEST_ASSERT_FLOAT_WITHIN(0.1f, 0.0f, resClean.iaq);
-  TEST_ASSERT_FLOAT_WITHIN(0.01f, 0.00f, resClean.vocPpm);
-  TEST_ASSERT_FLOAT_WITHIN(0.1f, 400.0f, resClean.eco2Ppm);
-
-  // Test 2: Bad air at 10% RH, 5,000 Ω -> IAQ ~468
-  IaqResultTest resBad = calculateIaqScoreTest(25.0f, 10.0f, 5000);
-  TEST_ASSERT_FLOAT_WITHIN(2.0f, 468.75f, resBad.iaq);
-  TEST_ASSERT_TRUE(resBad.vocPpm > 8.0f);
-  TEST_ASSERT_TRUE(resBad.eco2Ppm > 4000.0f);
-
-  // Test 3: Moderate air quality (IAQ 100) -> 40% RH, 38,000 Ω
-  IaqResultTest resMod = calculateIaqScoreTest(25.0f, 40.0f, 38000);
-  TEST_ASSERT_FLOAT_WITHIN(1.0f, 100.0f, resMod.iaq);
-
-  // Test 4: Poor air quality (IAQ 200) -> 40% RH, 26,000 Ω
-  IaqResultTest resPoor = calculateIaqScoreTest(25.0f, 40.0f, 26000);
-  TEST_ASSERT_FLOAT_WITHIN(1.0f, 200.0f, resPoor.iaq);
-
-  // Test 5: Hazardous air quality (IAQ ~416) -> 80% RH, 10,000 Ω
-  IaqResultTest resHazard = calculateIaqScoreTest(25.0f, 80.0f, 10000);
-  TEST_ASSERT_FLOAT_WITHIN(2.0f, 416.7f, resHazard.iaq);
-}
-
-
 void test_self_contained_audio_exact_length() {
   for (size_t count : {1, 2, 3, 1600}) {
     int16_t input[1600], output[1601];
@@ -315,19 +148,77 @@ void test_ble_wire_checksum_and_endianness() {
   TEST_ASSERT_EQUAL_UINT8_ARRAY(expected, bytes, 8);
 }
 
+void test_compact_imu_packet() {
+  PalBleImuRecord rows[2] = {{5000000000ULL,1793967805123ULL,17,1,{-32768,0,32767}},
+    {4999999991ULL,1793967805122ULL,18,2,{-1,2048,-2048}}};
+  uint8_t bytes[74] = {};
+  TEST_ASSERT_EQUAL_UINT32(74,palEncodeBleImu(bytes,sizeof(bytes),0x88cda63f1fb8ULL,123,4,5,6,true,rows,2));
+  TEST_ASSERT_EQUAL_HEX8(0xb8,bytes[0]);TEST_ASSERT_EQUAL_HEX8(0x88,bytes[5]);
+  TEST_ASSERT_EQUAL_UINT8(2,bytes[39]);TEST_ASSERT_EQUAL_UINT8(1,bytes[46]);
+  TEST_ASSERT_EQUAL_HEX8(0x80,bytes[48]);TEST_ASSERT_EQUAL_HEX8(0x7f,bytes[52]);
+  TEST_ASSERT_EQUAL_HEX8(0xf7,bytes[57]);TEST_ASSERT_EQUAL_HEX8(0xff,bytes[60]);
+  TEST_ASSERT_EQUAL_HEX8(0xff,bytes[61]);TEST_ASSERT_EQUAL_UINT8(2,bytes[63]);
+  TEST_ASSERT_EQUAL_UINT8(18,bytes[70]);
+  uint8_t rated[76]={};
+  TEST_ASSERT_EQUAL_UINT32(76,palEncodeBleImu(rated,sizeof(rated),0,1,2,3,4,true,rows,2,416));
+  TEST_ASSERT_EQUAL_HEX8(0xa0,rated[40]);TEST_ASSERT_EQUAL_HEX8(0x01,rated[41]);
+  TEST_ASSERT_EQUAL_UINT8(1,rated[48]);TEST_ASSERT_EQUAL_UINT8(2,rated[65]);
+  TEST_ASSERT_EQUAL_UINT32(0,palEncodeBleImu(bytes,73,0,0,0,0,0,true,rows,2));
+  rows[1].timeMs+=40000;
+  TEST_ASSERT_EQUAL_UINT32(0,palEncodeBleImu(bytes,sizeof(bytes),0,0,0,0,0,true,rows,2));
+}
+
+void test_ble_stream_packs_messages_and_bounds_tail() {
+  PalBleStream<495> stream;
+  uint8_t input[2000],output[2000];size_t written=0,calls=0;
+  for(size_t i=0;i<sizeof(input);++i)input[i]=i%251;
+  auto send=[&](const uint8_t *p,size_t n) {memcpy(output+written,p,n);written+=n;++calls;return true;};
+  TEST_ASSERT_TRUE(stream.append(input,556,495,100,send));
+  TEST_ASSERT_EQUAL_UINT32(61,stream.pending());TEST_ASSERT_EQUAL_UINT32(1,calls);
+  TEST_ASSERT_FALSE(stream.expired(129,30));TEST_ASSERT_TRUE(stream.expired(130,30));
+  TEST_ASSERT_TRUE(stream.append(input+556,1444,495,120,send));
+  TEST_ASSERT_EQUAL_UINT32(4,calls);TEST_ASSERT_EQUAL_UINT32(20,stream.pending());
+  TEST_ASSERT_TRUE(stream.flush(send));TEST_ASSERT_EQUAL_UINT32(5,calls);
+  TEST_ASSERT_EQUAL_UINT8_ARRAY(input,output,2000);
+  auto fail=[](const uint8_t*,size_t){return false;};
+  TEST_ASSERT_FALSE(stream.append(input,600,244,200,fail));TEST_ASSERT_EQUAL_UINT32(0,stream.pending());
+  TEST_ASSERT_TRUE(stream.append(input,10,244,0xfffffff0,send));
+  TEST_ASSERT_TRUE(stream.expired(20,30));stream.reset();TEST_ASSERT_EQUAL_UINT32(0,stream.pending());
+}
+
+void test_ble_audio_decimation_preserves_passband_rejects_aliases() {
+  int32_t input[960];int16_t output[480];
+  for(unsigned rate : {16000U,24000U}) {
+    for(double frequency : {1000.0,rate==24000?10000.0:6000.0,rate==24000?14000.0:10000.0}) {
+      PalBleAudioFilter filter;double sum=0;size_t samples=0;
+      for(int block=0;block<6;++block) {
+        for(size_t i=0;i<960;++i)input[i]=static_cast<int32_t>(1073741824.0*sin(2*3.141592653589793*frequency*(block*960+i)/48000));
+        const size_t n=filter.process(input,960,output,rate);TEST_ASSERT_EQUAL_UINT32(rate/50,n);
+        if(block)for(size_t i=0;i<n;++i){const double v=output[i]/32768.0;sum+=v*v;++samples;}
+      }
+      const double gain=sqrt(sum/samples)/sqrt(0.125);
+      if(frequency<rate/2)TEST_ASSERT_FLOAT_WITHIN(.002f,1.0f,static_cast<float>(gain));
+      else TEST_ASSERT_TRUE(gain<.0002); // >74 dB alias rejection, including int16 quantization
+    }
+  }
+  PalBleAudioFilter f;std::fill(input,input+960,1073741824);
+  f.process(input,960,output,24000);TEST_ASSERT_INT_WITHIN(1,16384,output[479]);
+  f.reset();std::fill(input,input+960,0);f.process(input,960,output,24000);
+  TEST_ASSERT_EQUAL_INT16(0,output[479]);
+}
+
 int main(int argc, char **argv) {
   UNITY_BEGIN();
+  RUN_TEST(test_a3_calibrated_battery_conversion);
   RUN_TEST(test_base64_encoding);
   RUN_TEST(test_pcm_quantization);
   RUN_TEST(test_dbfs_calculation);
-  RUN_TEST(test_battery_percentage);
-  RUN_TEST(test_neopixel_status_priority);
-  RUN_TEST(test_battery_save_pulse_math);
-  RUN_TEST(test_imu_fifo_unpacking);
   RUN_TEST(test_adpcm_encoder_decoder_roundtrip);
-  RUN_TEST(test_iaq_calculation);
   RUN_TEST(test_self_contained_audio_exact_length);
   RUN_TEST(test_ble_wire_checksum_and_endianness);
+  RUN_TEST(test_compact_imu_packet);
+  RUN_TEST(test_ble_stream_packs_messages_and_bounds_tail);
+  RUN_TEST(test_ble_audio_decimation_preserves_passband_rejects_aliases);
   return UNITY_END();
 }
 

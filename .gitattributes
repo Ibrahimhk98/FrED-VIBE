@@ -1,0 +1,2 @@
+# Preserve the pinned ST driver exactly as distributed, including CRLF endings.
+lib/LSM6DSOX/lsm6dsox_reg.[ch] -text whitespace=cr-at-eol

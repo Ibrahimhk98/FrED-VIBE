@@ -1,7 +1,7 @@
 export const ENV_FIELDS = ['temperature_c', 'humidity_pct', 'pressure_hpa', 'gas_ohms', 'iaq', 'voc_ppm', 'eco2_ppm', 'battery_v', 'battery_pct'];
 export const IMU_FIELDS = ['ax', 'ay', 'az', 'gx', 'gy', 'gz'];
 export const MAX_RECORDING_BYTES = 96 * 1024 * 1024;
-export function newSession() { return { version: 2, device: null, started: Date.now(), ended: 0, imu: [], environment: [], audio: [], bytes: 0, malformed: 0 }; }
+export function newSession() { return { version: 3, configuration: null, health: [], imu_raw: [], device: null, started: Date.now(), ended: 0, imu: [], environment: [], audio: [], bytes: 0, malformed: 0 }; }
 export function sessionBounds(session) {
   let start = Infinity, end = -Infinity;
   for (const key of ['imu', 'environment', 'audio']) for (const row of session[key]) {
@@ -10,7 +10,8 @@ export function sessionBounds(session) {
   }
   return Number.isFinite(start) ? [start, end] : [0, 0];
 }
-export function sessionCount(s) { return s.imu.length + s.environment.length + s.audio.length; }
+export const pcmScale = frame => frame.pcm instanceof Int32Array ? 2147483648 : 32768;
+export function sessionCount(s) { return s.imu.length + s.environment.length + s.audio.length + (s.imu_raw?.length || 0) + (s.health?.length || 0); }
 // Playback retains wall-clock gaps and uses each frame's own rate. No concatenation
 // that would speed up missing data or change pitch after a transport change.
 export function renderAudio(session, startMs, endMs, rate = 16000) {
@@ -27,7 +28,7 @@ export function renderAudio(session, startMs, endMs, rate = 16000) {
       const source = (startMs + i * 1000 / rate - frame.time_ms) * frame.rate / 1000;
       const j = Math.max(0, Math.min(frame.pcm.length - 1, Math.floor(source)));
       const next = Math.min(j + 1, frame.pcm.length - 1), mix = Math.max(0, source - j);
-      pcm[i] = (frame.pcm[j] * (1 - mix) + frame.pcm[next] * mix) / 32768;
+      pcm[i] = (frame.pcm[j] * (1 - mix) + frame.pcm[next] * mix) / pcmScale(frame);
     }
     covered += Math.max(0, to - from);
   }

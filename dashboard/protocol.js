@@ -83,14 +83,18 @@ export class ImaAdpcmDecoder {
 export function decodeAudio(data, transport) {
   const rate = Number(data.audio_rate_hz);
   const count = Number(data.audio_samples);
-  if (!Number.isInteger(rate) || rate < 8000 || rate > 48000 || !Number.isInteger(count) || count < 1 || count > 48000)
+  if (!Number.isInteger(rate) || rate < 8000 || rate > 52800 || !Number.isInteger(count) || count < 1 || count > 48000)
     throw new Error('Invalid audio rate or sample count');
-  const codec = data.audio_pcm_s16_b64 ? 'pcm_s16le' : 'ima_adpcm';
-  const payload = data.audio_pcm_s16_b64 ?? data.audio_adpcm_b64 ?? data.audio_adpcm_bytes;
+  const codec = data.audio_pcm_s32_b64 ? 'i2s_s32le' : data.audio_pcm_s16_b64 ? 'pcm_s16le' : 'ima_adpcm';
+  const payload = data.audio_pcm_s32_b64 ?? data.audio_pcm_s16_b64 ?? data.audio_adpcm_b64 ?? data.audio_adpcm_bytes;
   if (typeof payload !== 'string' && !(payload instanceof Uint8Array)) throw new Error('Missing audio payload');
   const bytes = payload instanceof Uint8Array ? payload : Uint8Array.from(atob(payload), c => c.charCodeAt(0));
   let pcm;
-  if (codec === 'pcm_s16le') {
+  if (codec === 'i2s_s32le') {
+    if (bytes.length !== count * 4) throw new Error('Truncated PCM frame');
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    pcm = Int32Array.from({length: count}, (_, i) => view.getInt32(i * 4, true));
+  } else if (codec === 'pcm_s16le') {
     if (bytes.length !== count * 2) throw new Error('Truncated PCM frame');
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
     pcm = Int16Array.from({length: count}, (_, i) => view.getInt16(i * 2, true));
@@ -112,7 +116,10 @@ export function decodeAudio(data, transport) {
 }
 
 export class LineParser {
-  constructor(onPacket, onError = () => {}) { this.buffer = ''; this.discarding = false; this.onPacket = onPacket; this.onError = onError; }
+  constructor(onPacket, onError = () => {}, {usbBootLog = false} = {}) {
+    this.buffer = ''; this.discarding = false; this.onPacket = onPacket; this.onError = onError;
+    this.usbBootLog = usbBootLog; this.seenPacket = false;
+  }
   push(text) {
     this.buffer += text;
     let end;
@@ -121,7 +128,10 @@ export class LineParser {
       if (this.discarding) { this.discarding = false; continue; }
       if (!line) continue;
       if (line.length > 65536) {this.onError(new Error('Oversized frame')); continue;}
-      try { this.onPacket(JSON.parse(line)); } catch (e) { this.onError(e); }
+      // Native CDC may reset on open. These are ROM/IDF diagnostics, not packets.
+      // Restrict filtering to known boot lines before the first valid JSON packet.
+      if (this.usbBootLog && !this.seenPacket && /^(ESP-ROM:|Build:|rst:0x|Saved PC:0x|SPIWP:0x|mode:|load:0x|entry 0x|E \(\d+\) esp_core_dump_flash: No core dump partition found!$)/.test(line)) continue;
+      try { const data = JSON.parse(line); this.onPacket(data); this.seenPacket = true; } catch (e) { this.onError(e); }
     }
     if (this.buffer.length > 65536) { this.buffer = ''; this.discarding = true; this.onError(new Error('Oversized frame')); }
   }

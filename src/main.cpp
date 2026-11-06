@@ -1,15 +1,16 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <RTClib.h>
-#include <Adafruit_BME680.h>
-#include <Adafruit_LSM6DSOX.h>
-#include <Adafruit_NeoPixel.h>
+#include "a3_sensors.h"
+#include <esp_heap_caps.h>
+#include <esp_system.h>
 #include <NimBLEDevice.h>
 #include <WiFi.h>
 #include <ESPmDNS.h>
 #include <Preferences.h>
 #include <WebSocketsServer.h>
 #include <driver/i2s.h>
+#include <a3_usb.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
@@ -21,24 +22,22 @@
 #include <cJSON.h>
 #include "ima_adpcm.h"
 #include "ble_packet.h"
+#include "ble_imu.h"
+#include "ble_stream.h"
+#include "ble_audio_filter.h"
+#include "firmware_version.h"
 
-// Feather V2 pin labels: A0=GPIO26, A1=GPIO25, A5=GPIO4.
-// A3/GPIO39 is input-only and cannot generate LRCL. Rewire LRCL to A5.
-// Both I2S slots are captured, so the ICS43434 SEL pin may select either slot.
-constexpr gpio_num_t MIC_BCLK = GPIO_NUM_26;
-constexpr gpio_num_t MIC_DOUT = GPIO_NUM_25;
-constexpr gpio_num_t MIC_LRCL = GPIO_NUM_4;
-constexpr gpio_num_t PIN_BATTERY = GPIO_NUM_35;
-constexpr gpio_num_t STATUS_NEOPIXEL_PIN = GPIO_NUM_0;
-constexpr gpio_num_t STATUS_NEOPIXEL_POWER_PIN = GPIO_NUM_2;
-constexpr uint32_t MIC_SAMPLE_RATE = 16000;
+constexpr gpio_num_t MIC_BCLK = static_cast<gpio_num_t>(FredPal::MIC_BCLK);
+constexpr gpio_num_t MIC_DOUT = static_cast<gpio_num_t>(FredPal::MIC_SD);
+constexpr gpio_num_t MIC_LRCL = static_cast<gpio_num_t>(FredPal::MIC_WS);
+constexpr int PIN_BATTERY = FredPal::BAT_ADC;
+constexpr uint32_t MIC_SAMPLE_RATE = FredPal::AUDIO_SAMPLE_RATE;
+constexpr uint32_t IMU_INTERVAL_MS = 10, PACKET_INTERVAL_MS = 100, ENV_INTERVAL_MS = 1000;
+constexpr size_t AUDIO_FRAME_SAMPLES = 960; // 20 ms at 48 kHz
 
-constexpr uint32_t IMU_INTERVAL_MS = 10;       // 100 Hz sensor acquisition
-constexpr uint32_t PACKET_INTERVAL_MS = 100;   // ten samples per telemetry packet
-constexpr uint32_t ENV_INTERVAL_MS = 1000;
-constexpr size_t AUDIO_FRAME_SAMPLES = MIC_SAMPLE_RATE / 10; // fixed 100 ms frames
-
-constexpr size_t BLE_MAX_CHUNK_BYTES = 244;   // matches negotiated MTU 247 (MTU - 3) to minimise notifies per packet
+// 495 value bytes + 7 ATT/L2CAP bytes fit two full 251-byte link-layer packets.
+// Smaller negotiated MTUs still use their exact available value capacity.
+constexpr size_t BLE_MAX_CHUNK_BYTES = 495;
 
 String deviceId, deviceName, deviceHostname;
 static const char *SERVICE_UUID = "7f510001-5b8d-4a84-9c7c-a07142ab6002";
@@ -46,27 +45,40 @@ static const char *DATA_UUID = "7f510002-5b8d-4a84-9c7c-a07142ab6002";
 static const char *COMMAND_UUID = "7f510003-5b8d-4a84-9c7c-a07142ab6002";
 
 RTC_DS3231 rtc;
-Adafruit_BME680 bme;
-Adafruit_LSM6DSOX lsm6dsox;
-Adafruit_NeoPixel pixel(1, STATUS_NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
+A3Environment bme;
+A3Imu imu;
 NimBLECharacteristic *dataCharacteristic = nullptr;
 i2s_port_t microphonePort = I2S_NUM_0;
 
-struct ImuSample {
-  uint32_t offsetMs;
-  float ax, ay, az;
-  float gx, gy, gz;
-};
-
-ImuSample imuSamples[16];
+struct ImuSample { int64_t monotonicUs; uint32_t sequence; uint8_t tag; int16_t xyz[3]; };
+ImuSample imuSamples[32];
 size_t imuCount = 0;
+uint32_t imuCounts[2] = {}, imuSegment = 0, imuOverruns = 0, imuDropped = 0, imuUnknownTags = 0;
+int64_t imuAnchors[2] = {};
+uint32_t imuAnchorCounts[2] = {};
+TaskHandle_t sensorTask = nullptr;
+volatile uint32_t telemetryDropped = 0, usbDropped = 0, bleDropped = 0;
+volatile uint32_t audioHighWater = 0, audioDropped = 0, audioOverruns = 0;
+uint32_t audioQueueFrames = 0;
+bool psramQueue = false;
+StaticQueue_t audioQueueControl;
+void sendConfiguration();
+void IRAM_ATTR imuInterrupt() {
+  BaseType_t wake = pdFALSE;
+  if (sensorTask) vTaskNotifyGiveFromISR(sensorTask, &wake);
+  if (wake) portYIELD_FROM_ISR();
+}
 bool rtcReady = false;
 bool rtcNeedsSync = false;
 bool bmeReady = false;
 bool imuReady = false;
 bool micReady = false;
+bool usbReady = false;
 volatile bool bleSubscribed = false;
 volatile size_t bleChunkBytes = 20;
+volatile uint16_t bleIntervalUnits = 0;
+volatile uint32_t bleNotifyRetries = 0;
+volatile uint32_t bleAudioRate=24000, bleConnectionEpoch=0;
 volatile uint16_t bleConnectionHandle = BLE_HS_CONN_HANDLE_NONE;
 uint64_t clockBaseMs = 0;
 uint32_t lastImuMs = 0;
@@ -78,7 +90,7 @@ uint32_t bmeReadyAtMs = 0;
 bool bmeReading = false;
 // Audio capture never waits for Serial, BLE, Wi-Fi, JSON serialization or sensors.
 struct AudioFrame {
-  int16_t pcm[AUDIO_FRAME_SAMPLES];
+  int32_t pcm[AUDIO_FRAME_SAMPLES]; // untouched left-slot DMA words, LE on ESP32-S3
   uint64_t sampleIndex;
   int64_t monotonicUs;
   uint32_t sequence, segment, droppedFrames, dmaOverruns;
@@ -91,7 +103,7 @@ portMUX_TYPE clockMux = portMUX_INITIALIZER_UNLOCKED;
 int64_t clockAnchorUs = 0;
 
 // Sensor and status lines have the same representation on all transports.
-struct OutgoingLine { char *text; };
+struct OutgoingLine { char *text; uint8_t *blePayload; uint16_t bleLength; uint8_t bleKind; };
 
 struct CommandMessage {
   char text[769];
@@ -152,74 +164,9 @@ String encodeBase64(const uint8_t *data, size_t length) {
 
 
 float readBatteryVoltage() {
-  // Adafruit Feather ESP32 V2 uses a 1:2 voltage divider (two 100k resistors) on GPIO35.
-  const uint32_t raw = analogRead(PIN_BATTERY);
-  const float vAdc = (static_cast<float>(raw) / 4095.0f) * 3.3f;
-  const float vBat = vAdc * 2.0f;
-  return vBat;
-}
-
-uint8_t calculateBatteryPercentage(float vBat) {
-  if (vBat >= 4.20f) return 100;
-  if (vBat <= 3.30f) return 0;
-  return static_cast<uint8_t>(constrain((vBat - 3.30f) / (4.20f - 3.30f) * 100.0f, 0.0f, 100.0f));
-}
-
-struct IaqResult {
-  float iaq;
-  float vocPpm;
-  float eco2Ppm;
-};
-
-IaqResult calculateIaqScore(float tempC, float humPct, uint32_t gasOhms) {
-  if (gasOhms == 0) {
-    return {0.0f, 0.0f, 400.0f};
-  }
-
-  // 1. Humidity Contribution (25% weight)
-  float sHum = 0.0f;
-  if (humPct >= 38.0f && humPct <= 42.0f) {
-    sHum = 25.0f;
-  } else if (humPct < 38.0f) {
-    sHum = (0.25f / 40.0f) * humPct * 100.0f;
-  } else {
-    sHum = ((-0.25f / 60.0f) * humPct + 0.4166f) * 100.0f;
-  }
-
-  // 2. Gas Resistance Contribution (75% weight)
-  float rGas = static_cast<float>(gasOhms);
-  constexpr float R_UPPER = 50000.0f; // Good air
-  constexpr float R_LOWER = 5000.0f;  // Bad air
-  if (rGas > R_UPPER) rGas = R_UPPER;
-  if (rGas < R_LOWER) rGas = R_LOWER;
-
-  float sGas = ((0.75f / (R_UPPER - R_LOWER)) * rGas - (R_LOWER * (0.75f / (R_UPPER - R_LOWER)))) * 100.0f;
-
-  // 3. IAQ Score and VOC estimation
-  float iaqPct = sHum + sGas; // 100% = perfectly clean
-  float rawIaq = (100.0f - iaqPct) * 5.0f; // 0 = best, 500 = worst
-  if (rawIaq < 0.0f) rawIaq = 0.0f;
-  if (rawIaq > 500.0f) rawIaq = 500.0f;
-
-  const float vocPpm = (rawIaq / 500.0f) * 10.0f;
-  const float eco2Ppm = 400.0f + (rawIaq * 8.0f);
-
-  return {rawIaq, vocPpm, eco2Ppm};
-}
-
-
-enum SystemStatusColor {
-  COLOR_BLUE,   // BLE Connected
-  COLOR_RED,    // Sensor Error or High Gas Alert
-  COLOR_AMBER,  // RTC Drift / Low Battery
-  COLOR_GREEN   // All Systems Normal
-};
-
-SystemStatusColor evaluateSystemStatus(bool bleConn, bool rtcOk, bool rtcSyncNeeded, bool imuOk, bool bmeOk, bool micOk, float vBat, uint32_t gasOhms) {
-  if (bleConn) return COLOR_BLUE;
-  if (!rtcOk || !imuOk || !bmeOk || !micOk || (bmeOk && gasOhms > 0 && gasOhms < 20000)) return COLOR_RED;
-  if (rtcSyncNeeded || (vBat > 0.5f && vBat < 3.48f)) return COLOR_AMBER;
-  return COLOR_GREEN;
+  uint32_t sum=0;
+  for (int i=0;i<8;++i) sum+=analogReadMilliVolts(PIN_BATTERY);
+  return FredPal::batteryVolts(sum/8);
 }
 
 void performSafeBleDisconnect() {
@@ -254,59 +201,21 @@ void checkBleSafetyTimeout() {
     return;
   }
 
+  // Snapshot before reading the clock: a callback on the other core may update
+  // the timestamp, otherwise unsigned subtraction can resemble a long timeout.
+  const uint32_t lastActivity = lastBleActivityMs;
   const uint32_t now = millis();
-  if (lastBleActivityMs > 0 && (now - lastBleActivityMs > 15000)) {
+  if (lastActivity > 0 && (now - lastActivity > (bleSubscribed ? 15000U : 60000U))) {
     performSafeBleDisconnect();
   }
 }
 
-void updateNeoPixelStatus() {
-  checkBleSafetyTimeout();
-  NimBLEServer *server = NimBLEDevice::getServer();
-  const bool activeBleConnected = bleSubscribed && (server != nullptr && server->getConnectedCount() > 0);
-  const float vBat = readBatteryVoltage();
-  const SystemStatusColor status = evaluateSystemStatus(
-    activeBleConnected, rtcReady, rtcNeedsSync, imuReady, bmeReady, micReady, vBat, bme.gas_resistance
-  );
-
-  uint8_t r = 0, g = 0, b = 0;
-  switch (status) {
-    case COLOR_BLUE:
-      b = 255;
-      break;
-    case COLOR_RED:
-      r = 255;
-      break;
-    case COLOR_AMBER:
-      r = 255; g = 140;
-      break;
-    case COLOR_GREEN:
-    default:
-      g = 255;
-      break;
-  }
-
-  if (wifiClientConnected) {
-    r = 0; g = 255; b = 255; // cyan: Wi-Fi high-fidelity streaming active
-  }
-
-  if (batterySaveMode) {
-    const uint32_t phase = millis() % 5000;
-    constexpr uint32_t PULSE_DURATION_MS = 600;
-    if (phase < PULSE_DURATION_MS) {
-      const float factor = sinf((static_cast<float>(phase) / static_cast<float>(PULSE_DURATION_MS)) * M_PI);
-      pixel.setPixelColor(0, pixel.Color(
-        static_cast<uint8_t>(r * factor),
-        static_cast<uint8_t>(g * factor),
-        static_cast<uint8_t>(b * factor)
-      ));
-    } else {
-      pixel.setPixelColor(0, pixel.Color(0, 0, 0));
-    }
-  } else {
-    pixel.setPixelColor(0, pixel.Color(r, g, b));
-  }
-  pixel.show();
+void updateStatusLed() {
+  const bool fault = !rtcReady || rtcNeedsSync || !imuReady || !bmeReady || !micReady;
+  // A3 has one active-HIGH green LED. Fast blink=fault, slow blink=idle, solid=link.
+  const bool lit = fault ? (millis()/250)%2 :
+    batterySaveMode ? (millis()%5000 < 250) : (wifiClientConnected || bleSubscribed || (millis()%2000 < 250));
+  digitalWrite(FredPal::STATUS_LED, lit ? HIGH : LOW);
 }
 
 uint64_t unixMsAt(int64_t monotonicUs) {
@@ -317,78 +226,48 @@ uint64_t unixMsAt(int64_t monotonicUs) {
 }
 uint64_t nowUnixMs() { return unixMsAt(esp_timer_get_time()); }
 
+PalBleStream<BLE_MAX_CHUNK_BYTES> bleWire;
+uint16_t bleWireHandle=BLE_HS_CONN_HANDLE_NONE;
+size_t bleWireLimit=0;
+
+bool notifyBleBytes(const uint8_t *data,size_t length) {
+  const uint16_t handle=bleConnectionHandle;
+  for(int attempt=0;attempt<100;++attempt) {
+    if(!bleSubscribed || handle!=bleConnectionHandle || handle!=bleWireHandle)return false;
+    if(dataCharacteristic->notify(data,length,handle)) {lastBleActivityMs=millis();return true;}
+    ++bleNotifyRetries;vTaskDelay(pdMS_TO_TICKS(2));
+  }
+  return false;
+}
+void serviceBleWire(bool flushTail=true) {
+  if(!bleSubscribed || bleWireHandle!=bleConnectionHandle || bleWireLimit!=bleChunkBytes) {
+    bleWire.reset();bleWireHandle=bleConnectionHandle;bleWireLimit=bleChunkBytes;
+  }
+  // A short final tail must also arrive when no more messages are pending.
+  if(flushTail && bleSubscribed && uxQueueMessagesWaiting(audioQueue)==0 && bleWire.expired(millis(),30) && !bleWire.flush(notifyBleBytes))++bleDropped;
+}
 void sendBleFrame(uint8_t kind, const uint8_t *payload, size_t payloadLength) {
-  if (dataCharacteristic == nullptr || !bleSubscribed) {
-    return;
-  }
-  if (payloadLength > 2048) return;
-  uint8_t wire[2060] = {'P', 'A', 'L', 2, kind, 0};
-  palWriteLE(wire + 6, payloadLength, 2);
-  palWriteLE(wire + 8, palCrc32(payload, payloadLength), 4);
-  memcpy(wire + 12, payload, payloadLength);
-  const size_t wireLength = payloadLength + 12;
-
-  const size_t chunkBytes = bleChunkBytes;
-  const uint16_t connectionHandle = bleConnectionHandle;
-
-  // Retry each notify briefly: a false return is controller tx congestion, not a lost
-  // link, and yielding lets the buffers drain over a connection interval or two.
-  auto notifyWithRetry = [&](const uint8_t *data, size_t length) -> bool {
-    // macOS connection intervals can exceed 12 ms. Wait through several radio
-    // events before abandoning a line when the controller's TX queue is full.
-    for (int attempt = 0; attempt < 100; ++attempt) {
-      if (!bleSubscribed || bleConnectionHandle != connectionHandle) return false;
-      if (dataCharacteristic->notify(data, length, connectionHandle)) {
-        lastBleActivityMs = millis();
-        return true;
-      }
-      vTaskDelay(pdMS_TO_TICKS(2));
-    }
-    return false;
-  };
-
-  for (size_t start = 0; start < wireLength; start += chunkBytes) {
-    const size_t length = min(chunkBytes, wireLength - start);
-    if (!notifyWithRetry(wire + start, length)) {
-      break;
-    }
-  }
+  if(dataCharacteristic==nullptr || !bleSubscribed)return;
+  if(payloadLength>4096) {++bleDropped;return;}
+  serviceBleWire(false);
+  uint8_t wire[4108]={'P','A','L',2,kind,0};
+  palWriteLE(wire+6,payloadLength,2);palWriteLE(wire+8,palCrc32(payload,payloadLength),4);
+  memcpy(wire+12,payload,payloadLength);
+  if(!bleWire.append(wire,payloadLength+12,bleWireLimit,millis(),notifyBleBytes))++bleDropped;
 }
 
 void sendBleLine(const String &line) {
-  // Binary IMU samples and audio avoid JSON/base64 overhead on the radio. Other
-  // messages retain JSON inside the same length-delimited, CRC-protected framing.
-  if (line.startsWith("{\"type\":\"telemetry\"")) {
-    cJSON *root = cJSON_Parse(line.c_str());
-    if (!root) return;
-    const cJSON *rows = cJSON_GetObjectItemCaseSensitive(root, "imu");
-    const cJSON *time = cJSON_GetObjectItemCaseSensitive(root, "time_ms");
-    const int count = cJSON_GetArraySize(rows);
-    if (count <= 16 && cJSON_IsNumber(time)) {
-      uint8_t payload[15 + 16 * 14] = {};
-      palWriteLE(payload, ESP.getEfuseMac(), 6);
-      palWriteLE(payload + 6, static_cast<uint64_t>(time->valuedouble), 8);
-      payload[14] = count;
-      bool fits = true;
-      for (int i = 0; i < count; ++i) {
-        const cJSON *row = cJSON_GetArrayItem(rows, i);
-        uint8_t *sample = payload + 15 + i * 14;
-        const uint32_t offset = cJSON_GetArrayItem(row, 0)->valuedouble;
-        if (offset > 65535) { fits = false; break; }
-        palWriteLE(sample, offset, 2);
-        for (int axis = 0; axis < 6; ++axis) {
-          // Recover the sensor's native signed 16-bit counts. JSON's four-decimal
-          // rounding is less than half a sensor LSB for both configured ranges.
-          const double scale = axis < 3 ? 0.122 * 9.80665 / 1000.0 : 17.50 * (3.14159265 / 180.0) / 1000.0;
-          const int32_t raw = lround(cJSON_GetArrayItem(row, axis + 1)->valuedouble / scale);
-          palWriteLE(sample + 2 + axis * 2, static_cast<uint16_t>(static_cast<int16_t>(constrain(raw, -32768, 32767))), 2);
-        }
-      }
-      if (fits) sendBleFrame(2, payload, 15 + count * 14);
-      else sendBleFrame(0, reinterpret_cast<const uint8_t *>(line.c_str()), line.length());
-    }
-    cJSON_Delete(root);
-  } else sendBleFrame(0, reinterpret_cast<const uint8_t *>(line.c_str()), line.length());
+  sendBleFrame(0, reinterpret_cast<const uint8_t *>(line.c_str()), line.length());
+}
+void sendUsbLine(const String &line) {
+  if (!usbReady) return;
+  // IDF queues the entire JSON line atomically or returns zero on timeout.
+  // Its ISR preserves short FIFO writes; Arduino 2.0.17 HWCDC can lose bytes.
+  const String packet = line + '\n';
+  // Never stall BLE/audio behind a USB host that is not reading. The 16 KiB
+  // ring absorbs active-host bursts; congestion drops an entire counted line.
+  const int written = a3_usb_write_bytes(packet.c_str(), packet.length(), 0);
+  if (written != static_cast<int>(packet.length())) ++usbDropped;
 }
 
 String identityFields() {
@@ -396,7 +275,8 @@ String identityFields() {
 }
 String sampleIdentityFields() { return ",\"device_id\":\"" + deviceId + "\""; }
 
-void enqueueTelemetry(const String &line, bool priority = false) {
+void enqueueTelemetry(const String &line, bool priority = false,
+    const uint8_t *blePayload = nullptr, size_t bleLength = 0, uint8_t bleKind = 0) {
   if (telemetryQueue == nullptr) return;
   String identified = line;
   if (identified.endsWith("}")) {
@@ -404,10 +284,15 @@ void enqueueTelemetry(const String &line, bool priority = false) {
     identified.remove(identified.length() - 1);
     identified += (samples ? sampleIdentityFields() : identityFields()) + "}";
   }
-  OutgoingLine item = {strdup(identified.c_str())};
-  if (item.text == nullptr) return;
+  OutgoingLine item = {strdup(identified.c_str()), nullptr, 0, bleKind};
+  if (item.text == nullptr) { ++telemetryDropped; return; }
+  if (bleLength) {
+    item.blePayload = static_cast<uint8_t *>(malloc(bleLength));
+    if (!item.blePayload) { free(item.text); ++telemetryDropped; return; }
+    memcpy(item.blePayload,blePayload,bleLength); item.bleLength=bleLength;
+  }
   if (xQueueSend(priority ? statusQueue : telemetryQueue, &item, 0) != pdTRUE) {
-    free(item.text);
+    free(item.text); free(item.blePayload); ++telemetryDropped;
   }
 }
 
@@ -425,6 +310,11 @@ void setRtcFromUnixMs(uint64_t unixMs) {
   {
     I2CLock lock;
     rtc.adjust(DateTime(static_cast<uint32_t>(unixMs / 1000ULL)));
+    const DateTime check=rtc.now();
+    Wire.beginTransmission(FredPal::DS3231_ADDRESS);
+    if (Wire.endTransmission()!=0 || rtc.lostPower() || !check.isValid() || llabs(static_cast<int64_t>(check.unixtime())-static_cast<int64_t>(unixMs/1000ULL))>1) {
+      sendStatus("command_error","RTC write/readback failed; clock was not accepted"); return;
+    }
   }
   portENTER_CRITICAL(&clockMux);
   clockBaseMs = unixMs;
@@ -456,6 +346,24 @@ void handleCommand(String command) {
     if (!valid) sendStatus("command_error", "SSID must be 1-32 bytes; password must be empty or 8-63 bytes");
     else if (xQueueSend(wifiQueue, &req, 0) != pdTRUE) sendStatus("command_error", "Wi-Fi request queue busy; retry");
     memset(&req, 0, sizeof(req));
+  } else if (!strcmp(cmd, "get_config")) {
+    sendConfiguration();
+  } else if (!strcmp(cmd, "set_sampling")) {
+    const cJSON *audio=cJSON_GetObjectItemCaseSensitive(root,"ble_audio_hz");
+    const cJSON *motion=cJSON_GetObjectItemCaseSensitive(root,"imu_hz");
+    const double a=cJSON_IsNumber(audio)?audio->valuedouble:0, m=cJSON_IsNumber(motion)?motion->valuedouble:0;
+    if((a!=16000 && a!=24000 && a!=48000) || (m!=26 && m!=52 && m!=104 && m!=208 && m!=416)) {
+      sendStatus("command_error","Supported BLE audio rates: 16000/24000/48000; IMU rates: 26/52/104/208/416");
+    } else if(!imuReady) sendStatus("command_error","IMU unavailable; sampling settings were not applied");
+    else {
+      const bool changed=imu.rateHz!=static_cast<uint16_t>(m);
+      if(changed && !imu.setRate(static_cast<uint16_t>(m))) {imuReady=false;sendStatus("command_error","IMU rate readback failed; restart the board");}
+      else {
+        if(changed) {++imuSegment;imuDropped+=imuCount;imuCount=0;imuAnchors[0]=imuAnchors[1]=0;}
+        bleAudioRate=static_cast<uint32_t>(a);
+        sendConfiguration();sendStatus("sampling_applied","Sampling settings applied; USB/Wi-Fi audio remains raw 48 kHz. Settings reset on reboot.");
+      }
+    }
   } else if (!strcmp(cmd, "set_time")) {
     const cJSON *time = cJSON_GetObjectItemCaseSensitive(root, "unix_ms");
     if (cJSON_IsNumber(time) && time->valuedouble >= 1577836800000.0 && time->valuedouble < 4102444800000.0)
@@ -510,28 +418,40 @@ class DataCallbacks : public NimBLECharacteristicCallbacks {
     if (bleSubscribed) {
       bleConnectionHandle = connInfo.getConnHandle();
       bleChunkBytes = min(BLE_MAX_CHUNK_BYTES, static_cast<size_t>(max(23, static_cast<int>(connInfo.getMTU())) - 3));
-      enqueueTelemetry("{\"type\":\"device\"}", true);
+      // Keep link tuning after the central's encryption/service discovery.
+      // Request Apple's 15 ms minimum; the central chooses the actual interval.
+      NimBLEServer *server = NimBLEDevice::getServer();
+      server->updateConnParams(connInfo.getConnHandle(), 12, 12, 0, 400);
+      server->setDataLen(connInfo.getConnHandle(), 251);
+      server->updatePhy(connInfo.getConnHandle(), BLE_GAP_LE_PHY_2M_MASK, BLE_GAP_LE_PHY_2M_MASK, 0);
+      sendConfiguration();
     }
   }
 };
 
 class ServerCallbacks : public NimBLEServerCallbacks {
+  void onConnParamsUpdate(NimBLEConnInfo &connInfo) override {
+    bleIntervalUnits = connInfo.getConnInterval();
+  }
   void onMTUChange(uint16_t mtu, NimBLEConnInfo &) override {
     bleChunkBytes = min(BLE_MAX_CHUNK_BYTES, static_cast<size_t>(max(23, static_cast<int>(mtu)) - 3));
   }
   void onAuthenticationComplete(NimBLEConnInfo &connInfo) override {
+    lastBleActivityMs = millis();
     sendStatus("ble_security", connInfo.isEncrypted() ? "Bluetooth link encrypted" : "Bluetooth encryption failed; reconnect");
   }
-  void onConnect(NimBLEServer *pServer, NimBLEConnInfo &connInfo) override {
+  void onConnect(NimBLEServer *, NimBLEConnInfo &connInfo) override {
+    ++bleConnectionEpoch;
     lastBleActivityMs = millis();
     bleConnectionHandle = connInfo.getConnHandle();
-    // Request a short interval; the central selects the final radio parameters.
-    pServer->updateConnParams(connInfo.getConnHandle(), 6, 12, 0, 200);
-    pServer->setDataLen(connInfo.getConnHandle(), 251);
+    bleIntervalUnits = connInfo.getConnInterval();
     commandCallbacks.reset();
-    NimBLEDevice::startSecurity(connInfo.getConnHandle());
+    // READ_ENC / WRITE_ENC trigger pairing when the central accesses commands.
+    // Do not race that request with an unsolicited peripheral security request.
   }
-  void onDisconnect(NimBLEServer * /*server*/, NimBLEConnInfo & /*connInfo*/, int /*reason*/) override {
+  void onDisconnect(NimBLEServer * /*server*/, NimBLEConnInfo & /*connInfo*/, int reason) override {
+    const String detail = "Bluetooth disconnected (reason " + String(reason) + ")";
+    sendStatus("ble_disconnected", detail.c_str());
     performSafeBleDisconnect();
   }
 };
@@ -549,7 +469,7 @@ void beginBle() {
       pairing.putUChar("protocol", 2);
     pairing.end();
   }
-  NimBLEDevice::setMTU(247);
+  NimBLEDevice::setMTU(517);
   NimBLEDevice::setSecurityAuth(true, false, true);
   NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
   NimBLEServer *server = NimBLEDevice::createServer();
@@ -563,7 +483,7 @@ void beginBle() {
   dataCharacteristic->setCallbacks(&dataCallbacks);
   commandCharacteristic->setCallbacks(&commandCallbacks);
   commandCharacteristic->setValue("PAL commands v2");
-  dataCharacteristic->setValue("PAL V2 ready");
+  dataCharacteristic->setValue("FrED PAL A3 ready");
   server->start();
 
   NimBLEAdvertising *advertising = NimBLEDevice::getAdvertising();
@@ -604,7 +524,7 @@ void onWebSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t lengt
   switch (type) {
     case WStype_CONNECTED:
       wifiClientConnected = true;
-      enqueueTelemetry("{\"type\":\"device\"}");
+      sendConfiguration();
       suspendBleForWifi();
       break;
     case WStype_DISCONNECTED:
@@ -720,12 +640,19 @@ void beginMicrophone() {
   config.communication_format = static_cast<i2s_comm_format_t>(I2S_COMM_FORMAT_STAND_I2S);
   config.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
   config.dma_buf_count = 8;
-  config.dma_buf_len = 256; // ~128 ms of buffering so packet-send stalls don't overflow
-  config.use_apll = true;   // APLL gives an accurate 16 kHz sample clock so recorded
-                            // audio duration matches playback (avoids ~4% drift)
+  config.dma_buf_len = 256; // 42.7 ms total stereo DMA storage
+  config.bits_per_chan = I2S_BITS_PER_CHAN_32BIT;
+  config.use_apll = false; // ESP32-S3 uses PLL clock, not original ESP32 APLL
+  config.mclk_multiple = I2S_MCLK_MULTIPLE_256;
+  config.total_chan = 2;
+  config.chan_mask = static_cast<i2s_channel_t>(I2S_TDM_ACTIVE_CH0 | I2S_TDM_ACTIVE_CH1);
+  config.left_align = true;
+  config.big_edin = false;
+  config.bit_order_msb = false; // IDF 4.4 field name is misleading: HAL true enables LSB-first
+  config.skip_msk = false;
 
   i2s_pin_config_t pins = {};
-  pins.mck_io_num = I2S_PIN_NO_CHANGE; // GPIO0 is the NeoPixel, not a microphone MCLK
+  pins.mck_io_num = I2S_PIN_NO_CHANGE; // A3 has no MCLK connection
   pins.bck_io_num = MIC_BCLK;
   pins.ws_io_num = MIC_LRCL;
   pins.data_out_num = I2S_PIN_NO_CHANGE;
@@ -744,13 +671,14 @@ void microphone_task(void *) {
   uint64_t sampleIndex = 0;
   uint32_t sequence = 0, segment = 0, dropped = 0, overruns = 0;
   size_t filled = 0;
-  int slot = -1;
+  constexpr int slot = 0; // S3 standard stereo DMA: left (WS LOW), then right
+  uint32_t settling = FredPal::AUDIO_SETTLING_FRAMES;
   int64_t anchorUs = 0;
   uint64_t anchorIndex = 0;
   // Installation occurs here, immediately before reading, so boot/BLE setup cannot
   // fill the DMA buffer before the capture task starts.
   beginMicrophone();
-  if (!micReady) { sendStatus("sensor_error", "ICS43434 I2S setup failed"); vTaskDelete(nullptr); return; }
+  if (!micReady) { sendStatus("sensor_error", "ICS-43432 I2S setup failed"); vTaskDelete(nullptr); return; }
   for (;;) {
     i2s_event_t event;
     bool discontinuity = false;
@@ -765,39 +693,28 @@ void microphone_task(void *) {
     }
     int32_t stereo[256];
     size_t bytesRead = 0;
-    if (i2s_read(microphonePort, stereo, sizeof(stereo), &bytesRead, pdMS_TO_TICKS(25)) != ESP_OK) continue;
+    const esp_err_t result=i2s_read(microphonePort, stereo, sizeof(stereo), &bytesRead, pdMS_TO_TICKS(25));
+    if (result!=ESP_OK || bytesRead%8) { ++overruns; ++segment; filled=0; anchorUs=0; continue; }
     const size_t count = bytesRead / (2 * sizeof(int32_t));
     if (!count) continue;
     if (!anchorUs) { anchorUs = esp_timer_get_time() - count * 1000000LL / MIC_SAMPLE_RATE; anchorIndex = sampleIndex; }
-    if (slot < 0) {
-      int64_t energy[2] = {0, 0};
-      for (size_t i = 0; i < count * 2; ++i) energy[i % 2] += llabs(static_cast<int64_t>(stereo[i]));
-      if (max(energy[0], energy[1]) > 0) {
-        slot = energy[0] >= energy[1] ? 0 : 1;
-        String diagnostics = "{\"type\":\"microphone_diagnostics\",\"slot\":" + String(slot);
-        for (int ch = 0; ch < 2; ++ch) {
-          double sum = 0, square = 0;
-          for (size_t i = 0; i < count; ++i) { const double v = stereo[i * 2 + ch] >> 16; sum += v; square += v * v; }
-          const double mean = sum / count;
-          diagnostics += ",\"slot" + String(ch) + "_mean\":" + String(mean, 3) + ",\"slot" + String(ch) + "_ac_rms\":" + String(sqrt(max(0.0, square / count - mean * mean)), 3);
-        }
-        enqueueTelemetry(diagnostics + "}");
-      }
-    }
     for (size_t i = 0; i < count; ++i) {
+      if (settling) { --settling; ++sampleIndex; continue; }
       if (!filled) {
         frame.sampleIndex = sampleIndex;
         frame.monotonicUs = anchorUs + (sampleIndex - anchorIndex) * 1000000LL / MIC_SAMPLE_RATE;
         frame.segment = segment;
-        frame.slot = slot < 0 ? 0 : slot;
+        frame.slot = slot;
       }
-      frame.pcm[filled++] = static_cast<int16_t>(stereo[i * 2 + frame.slot] >> 16);
+      frame.pcm[filled++] = stereo[i * 2 + frame.slot];
       ++sampleIndex;
       if (filled == AUDIO_FRAME_SAMPLES) {
         frame.sequence = sequence++;
         frame.droppedFrames = dropped;
         frame.dmaOverruns = overruns;
         if (xQueueSend(audioQueue, &frame, 0) != pdTRUE) ++dropped;
+        audioDropped=dropped; audioOverruns=overruns;
+        audioHighWater=max(static_cast<uint32_t>(audioHighWater),static_cast<uint32_t>(uxQueueMessagesWaiting(audioQueue)));
         filled = 0;
       }
     }
@@ -807,9 +724,9 @@ void microphone_task(void *) {
 // Each payload has an exact sample count; the final ADPCM nibble may be padding.
 void sendAudioFrame(const AudioFrame &frame) {
   double squareSum = 0;
-  for (const auto sample : frame.pcm) { const double v = sample / 32768.0; squareSum += v * v; }
+  for (const auto sample : frame.pcm) { const double v = sample / 2147483648.0; squareSum += v * v; }
   const double dbfs = squareSum > 0 ? 10 * log10(squareSum / AUDIO_FRAME_SAMPLES) : -120;
-  String header = "{\"type\":\"audio\",\"protocol\":2,\"stream_id\":" + String(streamId) +
+  String header = "{\"type\":\"audio\",\"protocol\":3,\"stream_id\":" + String(streamId) +
     ",\"sequence\":" + String(frame.sequence) + ",\"segment\":" + String(frame.segment) +
     ",\"audio_sample_index\":" + String(frame.sampleIndex) +
     ",\"audio_time_ms\":" + String(unixMsAt(frame.monotonicUs)) +
@@ -821,188 +738,148 @@ void sendAudioFrame(const AudioFrame &frame) {
     ",\"capture_dropped_frames\":" + String(frame.droppedFrames) +
     ",\"dma_overruns\":" + String(frame.dmaOverruns) +
     ",\"mic_slot\":" + String(frame.slot) + sampleIdentityFields();
-  uint8_t encoded[AUDIO_FRAME_SAMPLES / 2 + 4];
-  ImaAdpcmEncoder codec;
-  const size_t bytes = codec.encodeBlockSelfContained(frame.pcm, AUDIO_FRAME_SAMPLES, encoded);
-  const String compressed = header + ",\"audio_codec\":\"ima_adpcm\",\"audio_adpcm_b64\":\"" + encodeBase64(encoded, bytes) + "\"}";
-  Serial.println(compressed);
-  if (wifiClientConnected) {
-    sendWsLine(header + ",\"audio_codec\":\"pcm_s16le\",\"audio_pcm_s16_b64\":\"" +
-      encodeBase64(reinterpret_cast<const uint8_t *>(frame.pcm), sizeof(frame.pcm)) + "\"}");
-  } else if (bleSubscribed) {
-    uint8_t payload[60 + sizeof(encoded)] = {};
-    palWriteLE(payload, ESP.getEfuseMac(), 6);
-    palWriteLE(payload + 6, unixMsAt(frame.monotonicUs), 8);
-    palWriteLE(payload + 14, streamId, 4);
-    palWriteLE(payload + 18, frame.sequence, 4);
-    palWriteLE(payload + 22, frame.segment, 4);
-    palWriteLE(payload + 26, frame.sampleIndex, 8);
-    palWriteLE(payload + 34, frame.monotonicUs, 8);
-    palWriteLE(payload + 42, AUDIO_FRAME_SAMPLES, 2);
-    palWriteLE(payload + 44, MIC_SAMPLE_RATE, 2);
-    palWriteLE(payload + 46, frame.droppedFrames, 4);
-    palWriteLE(payload + 50, frame.dmaOverruns, 4);
-    const float level = dbfs;
-    memcpy(payload + 54, &level, 4);
-    payload[58] = rtcReady && !rtcNeedsSync;
-    payload[59] = frame.slot;
-    memcpy(payload + 60, encoded, bytes);
+  // Preserve all 32 received bits on USB/Wi-Fi. No unverified 24-bit shift.
+  if (usbReady || wifiClientConnected) {
+    const String raw=header + ",\"audio_codec\":\"i2s_s32le\",\"audio_pcm_s32_b64\":\"" +
+      encodeBase64(reinterpret_cast<const uint8_t *>(frame.pcm), sizeof(frame.pcm)) + "\"}";
+    sendUsbLine(raw);
+    if (wifiClientConnected) sendWsLine(raw);
+  }
+  if (!wifiClientConnected && bleSubscribed) {
+    // Bluetooth-only anti-alias filtering; USB/Wi-Fi above retain every raw word.
+    static PalBleAudioFilter filter;
+    static uint32_t previousSequence=0,previousSegment=0,previousRate=0,previousEpoch=0,previewSegment=0;
+    const uint32_t rate=bleAudioRate,epoch=bleConnectionEpoch;
+    const bool reset=previousRate!=rate || previousEpoch!=epoch || previousSegment!=frame.segment || frame.sequence!=previousSequence+1;
+    if(reset) {filter.reset();++previewSegment;}
+    previousRate=rate;previousEpoch=epoch;previousSegment=frame.segment;previousSequence=frame.sequence;
+    int16_t preview[AUDIO_FRAME_SAMPLES];size_t samples=0;
+    int64_t sampleTime=frame.monotonicUs;uint64_t sampleIndex=frame.sampleIndex;
+    if(rate==48000) {
+      for(size_t i=0;i<AUDIO_FRAME_SAMPLES;++i)preview[i]=frame.pcm[i]>>16;
+      samples=AUDIO_FRAME_SAMPLES;
+    } else {
+      samples=filter.process(frame.pcm,AUDIO_FRAME_SAMPLES,preview,rate);
+      if(reset)return; // discard one warm-up frame after connecting/rate change/gap
+      sampleTime-=PalBleAudioFilter::DELAY_SAMPLES*1000000LL/MIC_SAMPLE_RATE;
+      sampleIndex=(sampleIndex-PalBleAudioFilter::DELAY_SAMPLES)/(MIC_SAMPLE_RATE/rate);
+    }
+    uint8_t encoded[AUDIO_FRAME_SAMPLES/2+4];ImaAdpcmEncoder codec;
+    const size_t bytes=codec.encodeBlockSelfContained(preview,samples,encoded);
+    uint8_t payload[60+sizeof(encoded)]={};
+    double previewSquares=0;for(size_t i=0;i<samples;++i){const double v=preview[i]/32768.0;previewSquares+=v*v;}
+    const float level=previewSquares>0?10*log10(previewSquares/samples):-120;
+    palWriteLE(payload,ESP.getEfuseMac(),6);palWriteLE(payload+6,unixMsAt(sampleTime),8);
+    palWriteLE(payload+14,streamId,4);palWriteLE(payload+18,frame.sequence,4);palWriteLE(payload+22,previewSegment,4);
+    palWriteLE(payload+26,sampleIndex,8);palWriteLE(payload+34,static_cast<uint64_t>(sampleTime),8);
+    palWriteLE(payload+42,samples,2);palWriteLE(payload+44,rate,2);
+    palWriteLE(payload+46,frame.droppedFrames,4);palWriteLE(payload+50,frame.dmaOverruns,4);
+    memcpy(payload+54,&level,4);payload[58]=rtcReady && !rtcNeedsSync;payload[59]=frame.slot;
+    memcpy(payload+60,encoded,bytes);
     sendBleFrame(1, payload, 60 + bytes);
   }
 }
 
-void configureImuFifo() {
-  if (!imuReady) return;
-  I2CLock lock;
-  // FIFO_CTRL3 (0x09): BDR_GY[3:0] = 0x04 (104 Hz), BDR_XL[3:0] = 0x04 (104 Hz) -> 0x44
-  Wire.beginTransmission(LSM6DS_I2CADDR_DEFAULT);
-  Wire.write(0x09);
-  Wire.write(0x44);
-  Wire.endTransmission();
-
-  // FIFO_CTRL4 (0x0A): FIFO_MODE[2:0] = 0x03 (Continuous Mode)
-  Wire.beginTransmission(LSM6DS_I2CADDR_DEFAULT);
-  Wire.write(0x0A);
-  Wire.write(0x03);
-  Wire.endTransmission();
-}
-
 void readImuFifoBurst() {
   if (!imuReady) return;
-
-  I2CLock lock;
-  Wire.beginTransmission(LSM6DS_I2CADDR_DEFAULT);
-  Wire.write(0x3A); // FIFO_STATUS1
-  if (Wire.endTransmission() != 0) return;
-
-  Wire.requestFrom(static_cast<uint8_t>(LSM6DS_I2CADDR_DEFAULT), static_cast<uint8_t>(2));
-  if (Wire.available() < 2) return;
-  const uint8_t lsb = Wire.read();
-  const uint8_t msb = Wire.read();
-  uint16_t numWords = lsb | ((msb & 0x07) << 8);
-
-  if (numWords == 0) return;
-  if (numWords > 32) numWords = 32;
-
-  static float lastAx = 0.0f, lastAy = 0.0f, lastAz = 0.0f;
-  static float lastGx = 0.0f, lastGy = 0.0f, lastGz = 0.0f;
-
-  uint16_t wordsRemaining = numWords;
-  while (wordsRemaining > 0) {
-    uint16_t chunkWords = (wordsRemaining > 18) ? 18 : wordsRemaining;
-    uint8_t bytesToRead = chunkWords * 7;
-
-    Wire.beginTransmission(LSM6DS_I2CADDR_DEFAULT);
-    Wire.write(0x78); // FIFO_DATA_OUT_TAG
-    if (Wire.endTransmission() != 0) break;
-
-    Wire.requestFrom(static_cast<uint8_t>(LSM6DS_I2CADDR_DEFAULT), bytesToRead);
-    if (Wire.available() < bytesToRead) break;
-
-    for (uint16_t i = 0; i < chunkWords; ++i) {
-      uint8_t rawBytes[7];
-      for (int b = 0; b < 7; ++b) {
-        rawBytes[b] = Wire.read();
-      }
-
-      const uint8_t tag = rawBytes[0] >> 3;
-      const int16_t rawX = static_cast<int16_t>(rawBytes[1] | (rawBytes[2] << 8));
-      const int16_t rawY = static_cast<int16_t>(rawBytes[3] | (rawBytes[4] << 8));
-      const int16_t rawZ = static_cast<int16_t>(rawBytes[5] | (rawBytes[6] << 8));
-
-      if (tag == 0x02) { // Accel tag
-        constexpr float ACCEL_SCALE_MS2 = 0.122f * 9.80665f / 1000.0f;
-        lastAx = static_cast<float>(rawX) * ACCEL_SCALE_MS2;
-        lastAy = static_cast<float>(rawY) * ACCEL_SCALE_MS2;
-        lastAz = static_cast<float>(rawZ) * ACCEL_SCALE_MS2;
-      } else if (tag == 0x01) { // Gyro tag
-        constexpr float GYRO_SCALE_RADS = 17.50f * (3.14159265f / 180.0f) / 1000.0f;
-        lastGx = static_cast<float>(rawX) * GYRO_SCALE_RADS;
-        lastGy = static_cast<float>(rawY) * GYRO_SCALE_RADS;
-        lastGz = static_cast<float>(rawZ) * GYRO_SCALE_RADS;
-
-        if (imuCount < sizeof(imuSamples) / sizeof(imuSamples[0])) {
-          ImuSample &sample = imuSamples[imuCount++];
-          sample.offsetMs = millis() - lastPacketMs;
-          sample.ax = lastAx;
-          sample.ay = lastAy;
-          sample.az = lastAz;
-          sample.gx = lastGx;
-          sample.gy = lastGy;
-          sample.gz = lastGz;
-        }
-      }
-    }
-    wordsRemaining -= chunkWords;
+  uint16_t count=0; bool overflow=false;
+  if (!imu.level(count,overflow)) {
+    imuReady=false; sendStatus("sensor_error","LSM6DSOX identity/read failed; restart after checking hardware"); return;
   }
-}
-
-void sendTelemetryPacket() {
-  const uint64_t packetTime = nowUnixMs() - static_cast<uint32_t>(millis() - lastPacketMs);
-  String packet = "{\"type\":\"telemetry\",\"protocol\":2,\"time_ms\":" + String(packetTime) + ",\"imu\":[";
-  packet.reserve(1400);
-  for (size_t i = 0; i < imuCount; ++i) {
-    const ImuSample &s = imuSamples[i];
-    if (i) packet += ',';
-    packet += "[" + String(s.offsetMs) + ',' + String(s.ax, 4) + ',' + String(s.ay, 4) + ',' +
-              String(s.az, 4) + ',' + String(s.gx, 4) + ',' + String(s.gy, 4) + ',' + String(s.gz, 4) + "]";
-  }
-  packet += "]}";
-  enqueueTelemetry(packet);
-  imuCount = 0;
-}
-
-void sendEnvironment() {
-  bool bmeSuccess = false;
-  float tempC = 0.0f, humPct = 0.0f, pressPa = 0.0f;
-  uint32_t gasOhms = 0;
-  {
-    I2CLock lock;
-    if (bme.endReading()) {
-      bmeSuccess = true;
-      tempC = bme.temperature;
-      humPct = bme.humidity;
-      pressPa = bme.pressure;
-      gasOhms = bme.gas_resistance;
-    }
-  }
-  if (!bmeSuccess) {
-    sendStatus("sensor_error", "BME688 read failed");
+  if (overflow) {
+    ++imuOverruns; ++imuSegment; imuDropped+=imuCount; imuCount=0;
+    imuAnchors[0]=imuAnchors[1]=0;
+    if (!imu.restartFifo()) imuReady=false;
     return;
   }
-  const float vBat = readBatteryVoltage();
-  const uint8_t pctBat = calculateBatteryPercentage(vBat);
-  const IaqResult iaqRes = calculateIaqScore(tempC, humPct, gasOhms);
-  String packet = "{\"type\":\"environment\",\"time_ms\":" + String(nowUnixMs()) +
-                  ",\"temperature_c\":" + String(tempC, 2) +
-                  ",\"humidity_pct\":" + String(humPct, 2) +
-                  ",\"pressure_hpa\":" + String(pressPa / 100.0F, 2) +
-                  ",\"gas_ohms\":" + String(gasOhms) +
-                  ",\"iaq\":" + String(iaqRes.iaq, 1) +
-                  ",\"voc_ppm\":" + String(iaqRes.vocPpm, 2) +
-                  ",\"eco2_ppm\":" + String(iaqRes.eco2Ppm, 1) +
-                  ",\"battery_v\":" + String(vBat, 2) +
-                  ",\"battery_pct\":" + String(pctBat) + "}";
+  const int64_t now=esp_timer_get_time();
+  for (uint16_t i=0; i<min(count,static_cast<uint16_t>(128)); ++i) {
+    ImuSample sample={};
+    if (!imu.read(sample.tag,sample.xyz)) { ++imuDropped; break; }
+    if (sample.tag!=1 && sample.tag!=2) { ++imuUnknownTags; continue; }
+    const int stream=sample.tag-1;
+    if (!imuAnchors[stream]) {
+      imuAnchors[stream]=now - (max(1,static_cast<int>((count+1)/2))-1)*1000000LL/imu.rateHz;
+      imuAnchorCounts[stream]=imuCounts[stream];
+    }
+    sample.sequence=imuCounts[stream]++;
+    sample.monotonicUs=imuAnchors[stream]+(sample.sequence-imuAnchorCounts[stream])*1000000LL/imu.rateHz;
+    if (imuCount<32) imuSamples[imuCount++]=sample; else ++imuDropped;
+  }
+}
+void sendTelemetryPacket() {
+  if (!imuCount) return;
+  String packet="{\"type\":\"telemetry\",\"protocol\":3,\"time_ms\":" + String(nowUnixMs()) +
+    ",\"clock_synced\":" + String(rtcReady && !rtcNeedsSync ? "true":"false") +
+    ",\"stream_id\":"+String(streamId)+",\"imu_segment\":"+String(imuSegment)+
+    ",\"imu_overruns\":"+String(imuOverruns)+",\"imu_dropped\":"+String(imuDropped)+",\"imu_rate_hz\":"+String(imu.rateHz)+",\"imu_raw\":[";
+  packet.reserve(2400);
+  PalBleImuRecord records[32];
+  for(size_t i=0;i<imuCount;++i) {
+    const auto &r=imuSamples[i]; if(i) packet+=',';
+    const uint64_t timeMs=unixMsAt(r.monotonicUs);
+    records[i]={static_cast<uint64_t>(r.monotonicUs),timeMs,r.sequence,r.tag,{r.xyz[0],r.xyz[1],r.xyz[2]}};
+    packet+="["+String(static_cast<uint64_t>(r.monotonicUs))+','+String(r.tag)+','+String(r.xyz[0])+','+String(r.xyz[1])+','+String(r.xyz[2])+','+String(r.sequence)+','+String(timeMs)+"]";
+  }
+  uint8_t payload[PAL_BLE_IMU_HEADER+2+32*PAL_BLE_IMU_ROW];
+  const size_t length=palEncodeBleImu(payload,sizeof(payload),ESP.getEfuseMac(),streamId,imuSegment,
+    imuOverruns,imuDropped,rtcReady && !rtcNeedsSync,records,imuCount,imu.rateHz);
+  enqueueTelemetry(packet+"]}",false,payload,length,4); imuCount=0;
+}
+void sendEnvironment() {
+  bme68x_data data={}; bool ok;
+  { I2CLock lock; ok=bme.finish(data); }
+  if (!ok) { sendStatus("sensor_error","BME688 conversion failed or no new data"); return; }
+  const bool gasValid=data.status&BME68X_GASM_VALID_MSK, heaterStable=data.status&BME68X_HEAT_STAB_MSK;
+  String packet="{\"type\":\"environment\",\"time_ms\":"+String(nowUnixMs())+
+    ",\"clock_synced\":"+String(rtcReady && !rtcNeedsSync ? "true":"false")+
+    ",\"monotonic_us\":"+String(static_cast<uint64_t>(esp_timer_get_time()))+
+    ",\"temperature_c\":"+String(data.temperature,3)+",\"humidity_pct\":"+String(data.humidity,3)+
+    ",\"pressure_hpa\":"+String(data.pressure/100.0f,3)+",\"gas_ohms\":"+(gasValid && heaterStable ? String(data.gas_resistance,2):String("null"))+
+    ",\"new_data\":true,\"gas_valid\":"+String(gasValid?"true":"false")+",\"heater_stable\":"+String(heaterStable?"true":"false")+
+    ",\"measurement_index\":"+String(data.meas_index)+",\"profile_id\":1}";
   enqueueTelemetry(packet);
 }
-
 void startEnvironmentReading() {
   if (!bmeReady || bmeReading) return;
   I2CLock lock;
-  const uint32_t readyAt = bme.beginReading();
-  if (readyAt == 0) {
-    sendStatus("sensor_error", "BME688 start failed");
-    return;
-  }
-  bmeReadyAtMs = readyAt;
-  bmeReading = true;
+  const uint32_t duration=bme.start();
+  if (!duration) { sendStatus("sensor_error","BME688 start failed"); return; }
+  bmeReadyAtMs=millis()+duration; bmeReading=true;
+}
+void sendConfiguration() {
+  String config="{\"type\":\"configuration\",\"protocol\":3,\"hardware\":\"FrED PAL A3\",\"firmware\":\"" FRED_FIRMWARE_VERSION "\",\"ble_imu\":\"lossless_tagged_rate_kind4\",\"usb_driver\":\"esp-idf-usb-serial-jtag\",\"build\":\"" __DATE__ " " __TIME__ "\",\"arduino\":\"2.0.17\",\"idf\":\"";
+  config+=esp_get_idf_version();
+  config+="\",\"sampling_control\":true,\"ble_audio_rate_hz\":"+String(bleAudioRate)+",\"ble_filter\":\"kaiser129_decimation_delay_compensated_64_input_samples_24k_pass10k_stop12k_16k_pass6k_stop8k_48k_bypass\",\"stream_id\":"+String(streamId)+",\"reset_reason\":"+String(esp_reset_reason())+
+    ",\"flash_bytes\":"+String(ESP.getFlashChipSize())+",\"psram_bytes\":"+String(ESP.getPsramSize())+
+    ",\"audio_queue_frames\":"+String(audioQueueFrames)+",\"queue_memory\":\""+(psramQueue?"psram":"internal_reduced")+"\",";
+  config+="\"audio\":{\"sensor\":\"ICS-43432\",\"rate_hz\":48000,\"wire_slots\":2,\"slot_bits\":32,\"bclk_hz\":3072000,\"channel\":\"left\",\"container\":\"i2s_s32le\",\"valid_bits\":24,\"alignment\":\"unshifted_dma_requires_bench_validation\",\"settling_frames\":4224,\"ble\":\"ima_adpcm_lossy_preview\"},";
+  config+="\"imu\":{\"sensor\":\"LSM6DSOX\",\"spi_hz\":1000000,\"spi_mode\":3,\"odr_hz\":"+String(imu.rateHz)+",\"accel_g\":4,\"gyro_dps\":500,\"axes\":\"native_sensor\",\"timing\":\"independent_counter_estimates_not_synchronized\",\"filter\":\"reset_defaults\",\"ctrl1_4\":[";
+  for(int i=0;i<4;++i) {if(i)config+=','; config+=String(imu.registers[i]);}
+  config+="],\"driver_commit\":\"2e86793125f7f46b6195fce93a2b3cb76a51e564\"},";
+  config+="\"environment\":{\"driver_commit\":\"80ea120a8b8ac987d7d79eb68a9ed796736be845\",\"variant\":"+String(bme.device.variant_id)+",\"i2c_hz\":100000,\"address\":118,\"profile_id\":1,\"oversampling_tph\":[8,4,2],\"iir\":\"off\",\"heater_c\":320,\"heater_ms\":150,\"outputs\":\"compensated_TPH_and_valid_gas_resistance\"},\"overflow_policy\":\"drop_newest_count_gaps\",\"rtc_policy\":\"UTC_explicit_host_sync_OSF_invalid\",\"rtc_interrupt\":\"disabled\",\"battery_policy\":\"voltage_only_no_software_cutoff\",\"expansion\":\"disabled\"}";
+  enqueueTelemetry(config,true);
+}
+void sendHealth() {
+  enqueueTelemetry("{\"type\":\"health\",\"time_ms\":"+String(nowUnixMs())+
+    ",\"clock_synced\":"+String(rtcReady && !rtcNeedsSync ? "true":"false")+
+    ",\"battery_v\":"+String(readBatteryVoltage(),3)+",\"battery_pct\":null,\"imu_ready\":"+String(imuReady?"true":"false")+
+    ",\"bme_ready\":"+String(bmeReady?"true":"false")+",\"mic_ready\":"+String(micReady?"true":"false")+
+    ",\"imu_overruns\":"+String(imuOverruns)+",\"imu_dropped\":"+String(imuDropped)+",\"imu_unknown_tags\":"+String(imuUnknownTags)+
+    ",\"audio_dropped\":"+String(audioDropped)+",\"audio_overruns\":"+String(audioOverruns)+",\"audio_queue_high_water\":"+String(audioHighWater)+
+    ",\"telemetry_dropped\":"+String(telemetryDropped)+",\"usb_dropped\":"+String(usbDropped)+",\"ble_dropped\":"+String(bleDropped)+
+    ",\"ble_att_payload\":"+String(bleChunkBytes)+",\"ble_interval_ms\":"+String(bleIntervalUnits*1.25f,2)+",\"ble_notify_retries\":"+String(bleNotifyRetries)+
+    ",\"free_heap\":"+String(ESP.getFreeHeap())+",\"free_psram\":"+String(ESP.getFreePsram())+"}");
 }
 
 void readSerialCommands() {
   static String input;
   static bool discarding = false;
-  while (Serial.available()) {
-    const char c = static_cast<char>(Serial.read());
+  if (!usbReady) return;
+  char received[256];
+  const int length = a3_usb_read_bytes(received, sizeof(received), 0);
+  for (int i = 0; i < length; ++i) {
+    const char c = received[i];
     if (c == '\n' || c == '\r') {
       if (discarding) {
         sendStatus("command_error", "Serial command exceeded 768 bytes");
@@ -1047,18 +924,24 @@ void telemetry_net_task(void *pvParameters) {
     for (QueueHandle_t queue : {statusQueue, telemetryQueue}) {
       OutgoingLine item;
       for (int count = 0; count < 4 && xQueueReceive(queue, &item, 0) == pdTRUE; ++count) {
-        Serial.println(item.text);
+        sendUsbLine(String(item.text));
         if (wifiClientConnected) sendWsLine(String(item.text));
-        else if (bleSubscribed) sendBleLine(String(item.text));
-        free(item.text);
+        else if (bleSubscribed) {
+          if (item.bleLength) sendBleFrame(item.bleKind,item.blePayload,item.bleLength);
+          else sendBleLine(String(item.text));
+        }
+        free(item.text); free(item.blePayload);
       }
     }
 
     AudioFrame frame;
     if (xQueueReceive(audioQueue, &frame, 0) == pdTRUE) sendAudioFrame(frame);
+    serviceBleWire();
     checkBleSafetyTimeout();
 
-    vTaskDelay(pdMS_TO_TICKS(5));
+    // A blocked notify already waits for the radio. Do not add another 5 ms
+    // to every queued audio frame when catching up after a congested event.
+    vTaskDelay(pdMS_TO_TICKS(uxQueueMessagesWaiting(audioQueue) ? 1 : 5));
   }
 }
 
@@ -1072,7 +955,7 @@ void sensor_app_task(void *pvParameters) {
       lastImuMs = now;
       readImuFifoBurst();
     }
-    if (now - lastPacketMs >= PACKET_INTERVAL_MS) {
+    if (now - lastPacketMs >= min(PACKET_INTERVAL_MS,12000U/imu.rateHz)) {
       sendTelemetryPacket();
       lastPacketMs = now;
     }
@@ -1083,149 +966,68 @@ void sensor_app_task(void *pvParameters) {
     if (now - lastEnvMs >= ENV_INTERVAL_MS) {
       lastEnvMs = now;
       startEnvironmentReading();
+      sendHealth();
     }
     if (now - lastLedUpdateMs >= 250) {
       lastLedUpdateMs = now;
-      updateNeoPixelStatus();
+      updateStatusLed();
     }
 
-    vTaskDelay(pdMS_TO_TICKS(5));
+    ulTaskNotifyTake(pdTRUE,pdMS_TO_TICKS(5));
   }
 }
 
 void setup() {
-  // Audio is sent compressed as 4-bit IMA-ADPCM (4:1), so ~16 kHz voice fits well
-  // within 230400 baud (~23 KB/s). 230400 is a standard rate the macOS CP210x driver
-  // and Chrome Web Serial handle reliably (higher custom rates like 921600 are
-  // driver-flaky on macOS and corrupt the stream).
-  // Let UART transmission overlap BLE radio work instead of blocking each frame.
-  Serial.setTxBufferSize(8192);
-  Serial.begin(230400);
-  delay(300);
-
-  i2cMutex = xSemaphoreCreateMutex();
-  audioQueue = xQueueCreate(6, sizeof(AudioFrame));
-  wifiQueue = xQueueCreate(2, sizeof(WifiRequest));
-  streamId = esp_random();
-  char id[13];
-  snprintf(id, sizeof(id), "%012llx", static_cast<unsigned long long>(ESP.getEfuseMac()));
-  deviceId = id;
-  deviceName = "PAL-" + deviceId.substring(6);
-  deviceHostname = "pal-" + deviceId;
-  telemetryQueue = xQueueCreate(16, sizeof(OutgoingLine));
-  statusQueue = xQueueCreate(8, sizeof(OutgoingLine));
-  commandQueue = xQueueCreate(8, sizeof(CommandMessage));
-  if (!i2cMutex || !audioQueue || !wifiQueue || !telemetryQueue || !statusQueue || !commandQueue) {
-    Serial.println("{\"type\":\"status\",\"state\":\"fatal_error\",\"detail\":\"Queue allocation failed\"}");
-    for (;;) delay(1000);
+  digitalWrite(FredPal::STATUS_LED,LOW); pinMode(FredPal::STATUS_LED,OUTPUT);
+  digitalWrite(FredPal::IMU_CS,HIGH); pinMode(FredPal::IMU_CS,OUTPUT);
+  digitalWrite(FredPal::EXT_SPI_CS,HIGH); pinMode(FredPal::EXT_SPI_CS,OUTPUT);
+  pinMode(FredPal::IMU_INT1,INPUT); pinMode(FredPal::IMU_INT2,INPUT); pinMode(FredPal::RTC_INT,INPUT);
+  pinMode(PIN_BATTERY,INPUT);
+  // This driver exclusively owns hardware CDC. Do not start Arduino HWCDC.
+  usb_serial_jtag_driver_config_t usbConfig = {16384, 1024};
+  usbReady = a3_usb_driver_install(&usbConfig) == ESP_OK;
+  delay(150); // battery divider settling; never wait for a USB host
+  i2cMutex=xSemaphoreCreateMutex();
+  audioQueueFrames=24;
+  uint8_t *queueStorage=static_cast<uint8_t *>(heap_caps_malloc(audioQueueFrames*sizeof(AudioFrame),MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT));
+  psramQueue=queueStorage!=nullptr;
+  if (queueStorage) audioQueue=xQueueCreateStatic(audioQueueFrames,sizeof(AudioFrame),queueStorage,&audioQueueControl);
+  else { audioQueueFrames=6; audioQueue=xQueueCreate(audioQueueFrames,sizeof(AudioFrame)); }
+  wifiQueue=xQueueCreate(2,sizeof(WifiRequest));
+  telemetryQueue=xQueueCreate(16,sizeof(OutgoingLine)); statusQueue=xQueueCreate(8,sizeof(OutgoingLine)); commandQueue=xQueueCreate(8,sizeof(CommandMessage));
+  if (!usbReady || !i2cMutex || !audioQueue || !wifiQueue || !telemetryQueue || !statusQueue || !commandQueue || ESP.getFlashChipSize()!=8388608) {
+    for (;;) { sendUsbLine("{\"type\":\"status\",\"state\":\"fatal_error\",\"detail\":\"Allocation/USB failure or flash is not 8 MB\"}"); digitalWrite(FredPal::STATUS_LED,!digitalRead(FredPal::STATUS_LED)); delay(250); }
   }
-
-  pinMode(STATUS_NEOPIXEL_POWER_PIN, OUTPUT);
-  digitalWrite(STATUS_NEOPIXEL_POWER_PIN, HIGH);
-  pixel.begin();
-  pixel.setBrightness(20);
-
-  // Onboard NeoPixel RGB Boot Self-Test (Red -> Green -> Blue -> Yellow -> Cyan -> Magenta -> White -> Off)
-  const uint32_t bootColors[] = {
-    pixel.Color(255, 0, 0),     // Red
-    pixel.Color(0, 255, 0),     // Green
-    pixel.Color(0, 0, 255),     // Blue
-    pixel.Color(255, 255, 0),   // Yellow
-    pixel.Color(0, 255, 255),   // Cyan
-    pixel.Color(255, 0, 255),   // Magenta
-    pixel.Color(255, 255, 255), // White
-    pixel.Color(0, 0, 0)        // Off
-  };
-  for (size_t i = 0; i < sizeof(bootColors) / sizeof(bootColors[0]); ++i) {
-    pixel.setPixelColor(0, bootColors[i]);
-    pixel.show();
-    delay(150);
-  }
-
-  analogReadResolution(12);
-  analogSetAttenuation(ADC_11db);
-  Wire.begin(); // STEMMA QT uses SDA=GPIO22 and SCL=GPIO20 on this Feather.
-  Wire.setClock(400000); // Enable I2C Fast Mode (400 kHz)
-
+  streamId=esp_random(); char id[13]; snprintf(id,sizeof(id),"%012llx",static_cast<unsigned long long>(ESP.getEfuseMac()));
+  deviceId=id; deviceName="PAL-"+deviceId.substring(6); deviceHostname="pal-"+deviceId;
+  analogReadResolution(12); analogSetPinAttenuation(PIN_BATTERY,ADC_6db);
+  Wire.begin(FredPal::I2C_SDA,FredPal::I2C_SCL,FredPal::I2C_HZ); Wire.setTimeOut(50);
+  clockAnchorUs=esp_timer_get_time();
   {
     I2CLock lock;
-    rtcReady = rtc.begin();
-    if (rtcReady) {
-      rtcNeedsSync = rtc.lostPower();
-      if (rtcNeedsSync) rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
-      DateTime now = rtc.now();
-      clockBaseMs = static_cast<uint64_t>(now.unixtime()) * 1000ULL;
-      clockAnchorUs = esp_timer_get_time();
-    } else {
-      clockBaseMs = 0;
-      clockAnchorUs = esp_timer_get_time();
+    rtcReady=rtc.begin(&Wire); rtcNeedsSync=true;
+    if(rtcReady) {
+      const DateTime current=rtc.now();
+      rtcNeedsSync=rtc.lostPower() || !current.isValid() || current.year()<2020 || current.year()>=2100;
+      if(!rtcNeedsSync) {clockBaseMs=static_cast<uint64_t>(current.unixtime())*1000ULL; clockAnchorUs=esp_timer_get_time();}
+      rtc.disableAlarm(1); rtc.disableAlarm(2); rtc.clearAlarm(1); rtc.clearAlarm(2); rtc.writeSqwPinMode(DS3231_OFF); rtc.disable32K();
     }
-
-    bmeReady = bme.begin(0x77) || bme.begin(0x76);
-    if (bmeReady) {
-      bme.setTemperatureOversampling(BME680_OS_8X);
-      bme.setHumidityOversampling(BME680_OS_2X);
-      bme.setPressureOversampling(BME680_OS_4X);
-      bme.setIIRFilterSize(BME680_FILTER_SIZE_3);
-      bme.setGasHeater(320, 150);
-    }
-
-    imuReady = lsm6dsox.begin_I2C();
-    if (imuReady) {
-      lsm6dsox.setAccelRange(LSM6DS_ACCEL_RANGE_4_G);
-      lsm6dsox.setGyroRange(LSM6DS_GYRO_RANGE_500_DPS);
-      lsm6dsox.setAccelDataRate(LSM6DS_RATE_104_HZ);
-      lsm6dsox.setGyroDataRate(LSM6DS_RATE_104_HZ);
-
-      Wire.beginTransmission(LSM6DS_I2CADDR_DEFAULT);
-      Wire.write(0x09);
-      Wire.write(0x44);
-      Wire.endTransmission();
-
-      Wire.beginTransmission(LSM6DS_I2CADDR_DEFAULT);
-      Wire.write(0x0A);
-      Wire.write(0x03);
-      Wire.endTransmission();
-    }
+    bmeReady=bme.begin();
   }
-
+  imuReady=imu.begin();
   beginBle();
-
-  lastPacketMs = millis();
-  lastImuMs = lastPacketMs;
-  lastEnvMs = millis();
-  startEnvironmentReading();
-
-  sendStatus("ready", "Protocol v2: audio samples, IMU and environment over USB, BLE or Wi-Fi");
-  if (!rtcReady) sendStatus("sensor_error", "DS3231 not found");
-  if (rtcNeedsSync) sendStatus("clock_warning", "RTC lost power; synchronize it from the dashboard");
-  if (!imuReady) sendStatus("sensor_error", "LSM6DSOX not found");
-  if (!bmeReady) sendStatus("sensor_error", "BME688 not found");
-
-
-  xTaskCreatePinnedToCore(microphone_task, "microphone", 8192, nullptr, 3, nullptr, 0);
-
-  xTaskCreatePinnedToCore(
-    telemetry_net_task,
-    "telemetry_net",
-    16384,
-    nullptr,
-    2,
-    nullptr,
-    0
-  );
-
-  xTaskCreatePinnedToCore(
-    sensor_app_task,
-    "sensor_app",
-    12288,
-    nullptr,
-    2,
-    nullptr,
-    1
-  );
+  lastPacketMs=lastImuMs=lastEnvMs=millis(); startEnvironmentReading();
+  sendConfiguration();
+  sendStatus("ready","A3: raw 48 kHz audio on native USB/Wi-Fi; BLE is a lossy preview");
+  if(!psramQueue) sendStatus("memory_warning","PSRAM unavailable: explicit reduced 6-frame internal queue");
+  if(!rtcReady) sendStatus("sensor_error","DS3231 not found");
+  if(rtcNeedsSync) sendStatus("clock_warning","RTC invalid; explicit UTC synchronization required");
+  if(!imuReady) sendStatus("sensor_error","LSM6DSOX SPI identity or configuration failed");
+  if(!bmeReady) sendStatus("sensor_error","BME688 initialization failed at 0x76");
+  const bool tasksOk=xTaskCreatePinnedToCore(microphone_task,"microphone",12288,nullptr,3,nullptr,0)==pdPASS &&
+    xTaskCreatePinnedToCore(telemetry_net_task,"telemetry_net",24576,nullptr,2,nullptr,0)==pdPASS &&
+    xTaskCreatePinnedToCore(sensor_app_task,"sensor_app",12288,nullptr,2,&sensorTask,1)==pdPASS;
+  if(!tasksOk) { for(;;) { digitalWrite(FredPal::STATUS_LED,!digitalRead(FredPal::STATUS_LED)); sendUsbLine("{\"type\":\"status\",\"state\":\"fatal_error\",\"detail\":\"Task creation failed\"}"); delay(250); } }
+  if(imuReady) attachInterrupt(digitalPinToInterrupt(FredPal::IMU_INT1),imuInterrupt,RISING);
 }
-
-void loop() {
-  vTaskDelete(nullptr);
-}
+void loop() { vTaskDelete(nullptr); }

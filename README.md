@@ -1,317 +1,376 @@
-# PAL V2 sensor acquisition
+# FrED PAL A3 acquisition
 
-Firmware for an Adafruit ESP32 Feather V2 with an ICS43434 I2S microphone,
-LSM6DSOX IMU, BME688 environmental sensor, and DS3231 RTC. The browser dashboard
-connects over USB serial, Bluetooth LE, or Wi-Fi and saves synchronized time
-series to compressed HDF5. A separate explorer opens recordings, plots sensors
-on a shared timeline, and plays or exports selected audio ranges.
+Firmware and local dashboard for the **integrated FrED PAL A3 PCB**, using the
+ESP32-S3-WROOM-1-N8R8, ICS-43432 microphone, SPI LSM6DSOX, I2C BME688 and DS3231.
+The board mapping follows [the supplied A3 reference](FrED_PAL_A3_Firmware_Hardware_Reference.md).
+This firmware is **not for the older Feather V2 assembly**.
 
-## Build, flash, and open the dashboard
+## Build, flash and open
 
 ```sh
-~/.platformio/penv/bin/pio run -e adafruit_feather_esp32_v2
-~/.platformio/penv/bin/pio run -e adafruit_feather_esp32_v2 -t upload
+~/.platformio/penv/bin/pio run -e fred_pal_a3
+~/.platformio/penv/bin/pio device list
+~/.platformio/penv/bin/pio run -e fred_pal_a3 -t upload --upload-port /dev/cu.usbmodemYOUR_DEVICE
 npm ci
 npm run serve
 ```
 
-Open **http://localhost:8000** in desktop Chrome or Edge. `npm ci` copies the
-pinned h5wasm library into `dashboard/vendor`; after that, HDF5 import/export
-works without a CDN or an internet connection. Serve the entire dashboard
-directory, including its modules and vendor files. Opening `index.html` as a
-`file:` URL is unsupported. Font loading is optional; system fonts are used
-when offline. No recording data is sent to a cloud service.
-`npm run serve` also discovers the kits' `_pal-telemetry._tcp` mDNS service
-on the local network and exposes their IPv4 addresses to the dashboard. A plain
-static file server still supports acquisition, but does not provide discovery.
+Open **http://localhost:8000** in Chrome or Edge. The flashable application is
+`.pio/build/fred_pal_a3/firmware.bin`. Use PlatformIO's upload command to program
+its matching bootloader and partition table at the generated offsets; uploading
+only the application to a blank board is insufficient.
 
-The ESP32 uses Arduino-ESP32 2.0.17 / ESP-IDF 4.4 via PlatformIO
-`espressif32@6.9.0`. Do not update to Arduino core 3.x without migrating the
-legacy I2S and ADC drivers together.
+The pinned build uses PlatformIO `espressif32@6.9.0`, Arduino-ESP32 **2.0.17** /
+ESP-IDF **4.4.7**, 240 MHz CPU, 8 MB QIO flash at 80 MHz, and 8 MB **octal** PSRAM.
+Native USB hardware CDC/JTAG uses the vendored ESP-IDF driver adaptation in
+`lib/A3USB` (pending-event and idle-transfer fixes), with a 16 KiB
+TX buffer and nonblocking atomic JSON-line enqueue. This avoids byte loss in
+the pinned Arduino HWCDC implementation. Do not initialize `Serial` alongside
+this driver. USB packets dropped while no host is reading are counted in
+`usb_dropped`; compare counter increases during an active capture.
+`partitions_a3.csv` has a single 6 MiB
+factory application in 8 MiB flash; **OTA is disabled**. Do not update to core 3.x
+without migrating the legacy I2S and ADC interfaces together. Third-party driver
+versions and licenses are recorded in [lib/SOURCES.md](lib/SOURCES.md).
+
+A3 has no USB-to-UART adapter. Keep **SW1 ON** and use a data-capable USB-C cable.
+For a blank or unresponsive board: hold **SW3 BOOT**, press/release **SW2 RESET**,
+then release BOOT. Select the newly enumerated USB port and flash; reset afterward
+if necessary. A port may change between ROM download and application modes.
+If macOS lists no attached USB device at all, check the cable, host port,
+accessory permission and board power before retrying firmware upload.
+
+### Firmware panel
+
+Run `npm run firmware:build` to compile and bundle the four matching A3 flash
+images, then `npm run serve`. The **Device setup → Firmware** tab reads the installed version
+over USB, Bluetooth or Wi-Fi and compares it numerically with this checkout's
+bundled release. **Check firmware** refreshes the release and USB port list;
+**Read USB version** works without a live dashboard connection. It disconnects
+the live link first to release the serial port and retains the recording in memory.
+
+Stop and export a recording before selecting **Update via USB…**, then confirm
+the displayed version and USB board. Keep USB connected until verification
+finishes. The updater verifies SHA-256 package checksums, ESP32-S3 identity, MAC,
+8 MB flash, the flashed image digests, and the running firmware version after
+restart. If startup cannot be confirmed, it reports that separately and asks for
+RESET. A blank board can be flashed from ROM download mode without a version
+response. An installed newer version is not automatically downgraded.
+
+Updates use the local PlatformIO Python environment (override with `PAL_PYTHON`)
+and pinned esptool. The updater backports Espressif's
+[ESP32-S3 watchdog register correction](https://github.com/espressif/esptool/commit/6fd91af)
+to the bundled esptool 4.5.1, preventing watchdog resets during native-USB writes.
+The installer runs on the loopback dashboard server; it
+requires a same-origin JSON request, allows one USB operation at a time, and
+accepts only the local package, never an arbitrary image path. Generated bundles
+in `firmware/` are ignored by Git. Rebuild after source changes; reopen the updated
+dashboard after installing a new protocol. There is no online release feed or
+Bluetooth/OTA flashing; “available” means the locally bundled release.
 
 ## Connect and record
 
-- **USB:** choose **Connect USB**, select the USB serial adapter, and use
-  230400 baud. Close serial monitors before connecting. If Chrome does not list
-  the USB adapter but PlatformIO does, use **Connect USB bridge** with the local
-  helper below. Direct USB can also be checked with the smoke-test script.
-- **Bluetooth:** choose **Connect Bluetooth** and select the kit’s unique `PAL-xxxxxx` name.
-  Accept pairing if requested. Command writes require an encrypted connection.
-- **Wi-Fi:** use an existing device IP with **Connect selected kit**, or configure it
-  from Bluetooth/USB as described below. The browser and ESP32 must be able to
-  reach each other on the LAN; guest-network client isolation can prevent this.
-  Allow Chrome's local-network access prompt if requested. The socket is
-  `ws://<device-ip>:81/`, so use the localhost HTTP dashboard rather than an
-  HTTPS-hosted copy that would block mixed-content WebSockets.
+- **USB:** choose **Connect USB**, select the ESP32-S3 native USB port. The 230400
+  setting is retained for browser compatibility; USB CDC throughput is not a UART
+  baud-rate limit. Close serial monitors before connecting.
+- **Bluetooth:** choose **Connect Bluetooth**, select `PAL-xxxxxx`, and accept
+  pairing. Commands require encryption. Audio on this link is a lossy preview.
+- **Wi-Fi:** provision a 2.4 GHz SSID/password over USB/BLE, or select an already
+  discovered/saved kit and connect. WebSockets use `ws://<device-ip>:81/`.
+  The browser and kit must share a reachable LAN. `npm run serve` discovers
+  `_pal-telemetry._tcp` via mDNS; a plain static server supports manual addresses.
 
-| Link | Acoustic stream | Fidelity |
-| --- | --- | --- |
-| USB serial | 16 kHz mono, independently decodable IMA-ADPCM frames | Lossy 4-bit ADPCM, decoded to signed 16-bit PCM |
-| Bluetooth LE | 16 kHz mono, independently decodable IMA-ADPCM frames | Same codec; throughput depends on negotiated BLE link |
-| Wi-Fi WebSocket | 16 kHz mono, signed 16-bit little-endian PCM | Uncompressed captured samples |
+| Link | Audio | Representation |
+|---|---|---|
+| Native USB | 48 kHz mono, 960 samples/frame | All 32 bits of each left-slot DMA word, little endian |
+| Wi-Fi | Same raw capture as USB | Same `i2s_s32le` words, base64 in JSON Lines |
+| BLE | 24 kHz preview by default; selectable 16 / 24 / 48 kHz | Filtered/decimated at 16 / 24 kHz, lossy IMA-ADPCM |
 
-All links carry **sample sequences**, not sound-level averages. dBFS is an
-additional diagnostic. No automatic gain or DC filtering alters stored samples.
-The live waveform scales to the signal's observed amplitude range, including
-any DC offset. Explorer playback offers gain and an optional 20 Hz high-pass
-filter; neither changes HDF5 or WAV samples.
+The microphone has **24 valid bits**, not 32-bit measurement precision. USB/Wi-Fi
+retain the unshifted words, including trailing slot bits, so alignment can be
+verified on the first article without irreversible bit loss. The current preview
+assumes MSB-aligned microphone data; validate slot order, bit alignment, WS and
+BCLK with a scope and known tone before treating amplitude/rate as qualified.
+There is no automatic gain, DC removal, normalization or filtering in raw capture.
+BLE may drop frames when radio throughput is insufficient; use USB/Wi-Fi for raw
+acquisition. These are configured rates, not measured throughput guarantees.
 
-Synchronize the RTC before recording. Click **Record**, then **Stop** and
-**Export HDF5**. Recording is independent of continuous device streaming. A
-successful Bluetooth-to-Wi-Fi handoff can continue the same recording. A lost
-connection stops recording and retains the captured data. A new recording or
-Clear asks before discarding an existing session. Export is disabled while
-recording so the saved file has a definite end.
+Synchronize UTC using **Sync RTC to PC** before recording. Invalid RTC time is
+explicitly marked; firmware never fills it with compile time. Select **Record**,
+then **Stop**, then **Export HDF5**. A connection loss stops recording and retains
+captured data. **Choose folder…** remembers an export directory in supported
+browsers; otherwise files use browser downloads. New recordings/Clear prompt
+before discarding data. Recordings stay in browser memory until exported, with a
+96 MiB estimated cap. HDF5 work runs in a worker; `npm ci` vendors h5wasm locally.
+No recording data is uploaded to a cloud service.
 
-Use **Recording location → Choose folder…** to select an HDF5 export folder.
-The folder name is shown beside the recording controls and remembered in this
-browser. After **Stop**, **Export HDF5** writes directly into that folder; the
-browser may ask you to allow access again after a restart. Repeated exports get
-a numbered filename instead of replacing an existing recording. Cancelling the
-picker keeps the current location. Permission or disk errors retain the recording
-in memory so you can select another folder and retry.
+**Explore recording** opens a separate analysis window without stopping capture.
+The explorer imports schema v2 and v3, plots a shared timeline, and plays/exports
+selected audio ranges with gaps preserved. Playback gain/filtering and 16-bit WAV
+export are listening derivatives; HDF5 retains the original received values.
 
-**Use browser downloads** restores the default download behavior. Folder selection
-requires a browser supporting the File System Access API, such as desktop Chrome
-or Edge. Other browsers use their download settings. Choosing a folder does not
-enable automatic saving during capture; stop and export each recording.
+## Device render and trim
 
-Recordings remain in browser memory until exported; closing/reloading the page
-loses unexported data; a leave-page warning protects active connections and
-unexported recordings. Switching to analysis or returning through its navigation
-does not reload the acquisition page. A 96 MiB estimated recording cap stops acquisition into
-memory and asks for export. HDF5 work runs in a dedicated worker. Audio is held
-as `Int16Array` chunks; it is not expanded into one JS object per audio sample.
+The live **Device orientation** card renders a 68 × 68 mm A3 PCB with mounting
+holes, antenna overhang and illustrative component placement. Accelerometer and
+gyroscope samples drive a gravity-corrected quaternion attitude estimate in a
+world with **Z up**. Place the board on a **flat, level surface, component side
+up**, choose **Trim orientation**, and start the two-second calibration. Movement
+restarts the stillness window. Calibration measures gyro bias and a fixed
+board-to-sensor transform; the current heading becomes zero. **Clear trim**
+restores the sensor reference. Trim affects the view only, never recorded axes.
 
-## USB bridge fallback
+The view follows **rotation and tilt**, not linear position. Without a
+magnetometer, heading is relative and may drift. Gravity correction is reduced
+during acceleration. Gaps skip gyro integration and reacquire gravity while
+preserving the fixed trim. Restarts and device changes clear calibration; stale
+data disables trim. This is an illustrative model, not a CAD import.
 
-For adapters missing from Chrome’s serial chooser, run this once with Python 3.10+
-(the PlatformIO Python interpreter also works):
+## A3 hardware allocation
 
-```sh
-python3 -m venv .venv-usb
-.venv-usb/bin/pip install -r scripts/requirements-usb.txt
+| Function | Explicit GPIOs/configuration |
+|---|---|
+| ICS-43432 | BCLK4, WS5, DIN6; fixed left slot; no MCLK, mute or power-enable pin |
+| I2S wire format | Philips, two 32-bit slots, 64 clocks/frame; configured WS 48 kHz / BCLK 3.072 MHz |
+| LSM6DSOX | FSPI SCK12 / MISO13 / MOSI11 / CS10; mode 3 at 1 MHz; INT1=14, INT2=15 |
+| Shared I2C | SDA8 / SCL9, 100 kHz, 50 ms timeout; BME688=0x76, DS3231=0x68 |
+| RTC interrupt | GPIO7 input; alarms and square-wave output disabled |
+| Battery ADC | GPIO1, calibrated millivolts, 6 dB attenuation; ×1330/330 divider factor |
+| Status LED | GPIO2, active-HIGH green; no NeoPixel |
+| USB | GPIO19/20 reserved |
+| Student SPI | 40/41/42/47 reserved, CS47 HIGH; peripheral disabled |
+
+Onboard SPI belongs exclusively to the IMU. Any student SPI driver must use a
+separate `SPIClass(HSPI)` and explicit external pins. Expansion modules are not
+auto-initialized. GPIO35–37 are reserved for octal PSRAM. No charger state,
+USB-power detection, battery temperature, current or software power-switch GPIO
+is invented. Battery terminal voltage is reported once per second, with no inferred charge
+percentage or automatic cutoff. Validate voltage against a meter. Low-battery
+shutdown requires a separate pack-specific policy.
+
+With J2 empty and USB powering the board, the BQ24073's battery-detection routine
+can repeatedly discharge and recharge the BAT terminal. Large changes in the
+reported `battery_v` are consistent with this behavior; this field measures BAT,
+not USB input or the regulated 3.3 V rail. The dashboard calls it **Battery
+terminal voltage**. Firmware cannot reliably determine battery presence from
+voltage alone. See [TI datasheet §9.3.5.4](https://www.ti.com/lit/ds/symlink/bq24073.pdf).
+
+The green status LED is solid with a wireless link, slow-blinks while idle, and
+fast-blinks when a sensor/RTC is unavailable or RTC synchronization is required.
+A microphone setup success indicates the I2S driver started, not an electrical
+identity check: this microphone has no readable ID interface.
+
+## Acquisition and protocol
+
+- Audio has an independent DMA capture task. It discards **4,224 startup frames**
+  (above the required 4,096), then queues 960-word blocks without waiting for
+  networking. DMA buffers stay in internal RAM. The queue holds 24 frames in
+  PSRAM (480 ms); a reported reduced mode holds 6 frames internally if PSRAM is
+  unavailable. Full queues drop **newest** blocks and count losses.
+- IMU identification checks `WHO_AM_I=0x6C`, resets with a 100 ms deadline,
+  programs four-wire SPI, BDU and increment, disables I2C/I3C, and checks range,
+  ODR and FIFO mode readback. Both sensors use **104 Hz**, ±4 g / ±500 dps, reset
+  default filters, tagged continuous FIFO and watermark 8. INT1 only notifies the
+  sensor task; timed polling catches missed edges. Each seven-byte FIFO record
+  is read in its own transaction. Overruns reset continuity and are counted.
+- Accelerometer and gyro records retain separate counters and native signed
+  counts. Timestamps are reconstructed from nominal ODR and initial drain time,
+  **not hardware-synchronized sensor timestamps**. The dashboard pairs only
+  fresh nearby readings for the orientation/converted preview. Raw records are
+  preserved separately. Unknown tags, FIFO losses and application drops are
+  exposed in health records.
+- Bosch's BME68x SensorAPI handles identity, variant and calibration. Forced mode
+  uses T/P/H oversampling 8×/4×/2×, IIR off, and a 320 °C / 150 ms heater profile.
+  Conversions are scheduled without holding I2C while waiting. Only new completed
+  readings are emitted. Gas resistance is null unless gas-valid **and**
+  heater-stable flags are set. No synthetic IAQ, VOC or eCO₂ is generated.
+- RTC and BME share a mutex. RTC OSF/implausible dates invalidate UTC; only explicit
+  `set_time` updates it, with readback. `esp_timer_get_time()` anchors UTC to
+  monotonic time. Unsynchronized times are boot-relative; read validity flags.
+- Sensor initialization failures are reported and leave other streams running.
+  A failed IMU identity during capture disables its stream until restart. This
+  release does not automatically power-cycle peripherals or retry indefinitely.
+- Networking is separate from acquisition, with bounded queues, serial timeouts,
+  BLE retries and WebSocket timeout. Health reports queue occupancy/high-water,
+  audio DMA overruns/drops, IMU counters, USB/BLE/telemetry drops, battery and heap.
+  Finite buffering is not lossless during arbitrary outages.
+
+USB/Wi-Fi use JSON Lines with types `configuration`, `audio`, `telemetry`,
+`environment`, `health` and `status`. Application protocol is **3**. Audio has
+`audio_pcm_s32_b64` / `audio_codec: "i2s_s32le"` on raw links, per-frame sequence,
+boot ID, continuity segment, sample index, monotonic time and UTC validity.
+The left slot is DMA index 0 on the selected S3 standard-I2S configuration.
+
+`telemetry.imu_raw` rows are:
+
+```text
+[monotonic_us, tag, x_raw, y_raw, z_raw, stream_sample_counter, time_ms]
 ```
 
-Start the helper alongside `npm run serve`:
+Tag 1 is gyro and tag 2 is accelerometer. Packet fields include `stream_id`,
+`imu_segment`, `imu_overruns`, `imu_dropped` and `clock_synced`. Scaling is
+0.122 mg/LSB and 17.5 mdps/LSB; raw axes are never relabeled as enclosure axes.
+Configuration records include hardware/firmware/build/framework versions,
+read-back IMU registers, driver commits, format/profile/rate choices, memory
+sizes, queue policy and reset reason. `get_config` retrieves them after connecting.
 
-```sh
-.venv-usb/bin/python scripts/usb_bridge.py
-```
+BLE retains the v2 CRC envelope (`PAL`, byte 2, kind, reserved, uint16 length,
+uint32 IEEE CRC32; little endian) for compatibility, with a 4,096-byte payload
+limit. Kind 0 carries configuration/status/environment/health JSON; kind 1 retains
+the compact ADPCM layout with explicit sample rate and count. Firmware a3-1.1.0 sends raw tagged IMU as lossless
+kind 3: a 40-byte header (MAC, 64-bit UTC/monotonic bases, stream, segment, overrun
+and drop counters, clock flag, count) followed by 17-byte records (signed 32-bit
+microsecond delta, signed 16-bit millisecond delta, tag, three int16 counts, uint32
+sequence). This preserves independent timestamps and reduces radio overhead.
+The decoder also accepts legacy kind-2 IMU and kind-0 raw IMU JSON. Reload the
+dashboard before using new firmware. Service/characteristic UUIDs are unchanged.
 
-Then choose **Connect USB bridge**. With several USB adapters attached, specify
-`--port /dev/cu.usbserial-YOUR_DEVICE`. The helper uses the wired serial link;
-it does not require ESP32 Wi-Fi or Bluetooth. It listens only on loopback,
-accepts the localhost:8000 dashboard origin, and permits one connected dashboard.
-Recordings retain `usb` as their source transport. Stop the helper with Ctrl+C.
+USB writes never wait on an unread host, which previously stalled the shared
+transmitter while using Bluetooth. Live audio now plots acquisition timestamps
+and leaves missing intervals blank, matching Data Explorer instead of joining
+received frames together. Explorer and stopped recordings report missing frame
+counts, missing duration and capture-queue loss. Radio capacity can still limit
+BLE; these diagnostics do not invent or interpolate absent samples.
+Firmware requests a 15 ms BLE connection interval and 2M PHY where
+supported, and shortens the transmitter's idle delay while audio is queued.
+The central chooses the final radio parameters; **Link diagnostics** shows
+the negotiated interval, notification capacity, retries and queue high-water mark.
+Firmware a3-1.1.2 and later requests MTU 517 and packs CRC-framed messages across
+notifications, using up to 495 value bytes (two 251-byte link-layer packets).
+Older/smaller central MTUs are still supported. A final short tail is flushed
+when idle; the parser makes no assumption about notification boundaries.
 
-## Configure Wi-Fi over Bluetooth
+### Sampling controls
 
-1. Connect Bluetooth (or USB) and expand **Configure Wi-Fi over Bluetooth or USB**.
-2. Enter a **2.4 GHz** network name and password. SSIDs are 1–32 UTF-8 bytes;
-   passwords are empty for an open network, or 8–63 bytes for a passphrase.
-   Spaces, quotes and backslashes are preserved through JSON escaping.
-3. Click **Send credentials & switch**. Commands are serialized and fragmented
-   into acknowledged 20-byte BLE writes, then reassembled on the ESP32 before parsing.
-4. The device joins asynchronously and announces its IP on the current link.
-   The dashboard opens the WebSocket automatically, then releases the old link.
-   BLE is suspended only after a WebSocket client connects.
-5. Failed association times out after 20 seconds and restores BLE availability.
-   A closed WebSocket restores BLE advertising. **Turn Wi-Fi off** switches
-   the radio back to BLE; reconnect Bluetooth to resume streaming.
+Open **Device setup → Sampling** while connected. Select Bluetooth microphone
+rate **16 / 24 / 48 kHz** and accelerometer/gyroscope rate **26 / 52 / 104 / 208 /
+416 Hz**, then **Apply sampling rates**. The board acknowledges and reports its
+configuration; the IMU driver reads back both ODR and FIFO batching registers.
+Settings last until reboot (defaults: BLE 24 kHz, IMU 104 Hz). Recording must be
+stopped. The microphone selector affects Bluetooth only: USB/Wi-Fi retain
+48 kHz raw DMA words. Higher IMU rates consume more wireless bandwidth.
 
-Credentials are held in device RAM, are never echoed into telemetry or saved
-with recordings, and are cleared from the dashboard password input after being
-sent. A reboot returns to Bluetooth/USB setup. They are not persisted to flash.
-BLE uses encrypted “Just Works” pairing (no authenticated passkey); Wi-Fi
-WebSockets are unencrypted and unauthenticated. Use the kit on a trusted LAN.
+For Bluetooth 24 / 16 kHz, a 129-tap symmetric Kaiser low-pass filter precedes
+2:1 / 3:1 decimation. The 24 kHz passband is up to 10 kHz, stopband from 12 kHz;
+16 kHz uses 6 / 8 kHz. The 64-input-sample group delay is compensated in timestamps.
+One preview frame is discarded to settle the filter after connection, rate change
+or a capture gap. No raw words are filtered or replaced. Coefficients are
+reproducible with `scripts/design_ble_filter.py`; native tests check in-band gain,
+>74 dB rejection at test stopband tones including int16 rounding, and reset state.
+The 48 kHz BLE option bypasses this filter and retains the previous lossy preview.
 
-## Multiple kits on one router
+Firmware a3-1.2.0 uses kind 4 for IMU: the kind-3 header plus uint16 actual ODR at
+byte 40, with 17-byte records starting at byte 42. The decoder retains kind-3
+compatibility at its original 104 Hz. FIFO polling, batching, timestamp increments
+and preview pairing respect the selected ODR. An IMU rate change begins a new
+motion segment and clears display trim. HDF5 stores the applied configuration.
+Commands use `{"cmd":"set_sampling","ble_audio_hz":24000,"imu_hz":104}`.
 
-Each kit has a stable hardware-derived ID, a Bluetooth name such as
-`PAL-d6cdc0`, and a unique mDNS hostname such as `pal-346c38d6cdc0.local`.
-Every sensor/audio/status packet includes the device ID; connection/status
-packets also carry the name and hostname to avoid repeating them in every frame. Multiple kits
-can stay associated with the same 2.4 GHz access point while the dashboard
-subscribes to one kit at a time.
-
-Provision each kit over Bluetooth. With **npm run serve**, the dashboard lists
-each discovered kit's name and IP in **Wi-Fi kits · name and IP**, with selectable
-address cards below. Discovery refreshes every five seconds without connecting
-to the kits or interrupting Bluetooth. Select a kit, then **Connect selected kit**
-to switch. You can also enter its IP or hostname and choose **Remember address**.
-The registry stores addresses and names in browser local storage, never Wi-Fi
-passwords. The actual device ID replaces an address-only entry when connected.
-Discovery updates a kit's address after DHCP changes it. Saved addresses are
-labelled separately and remain selectable when discovery is unavailable.
-
-The local Node server browses mDNS; it does not scan arbitrary addresses or
-connect to every kit. It listens only on loopback and only serves its inventory
-to the local dashboard. Entries are shown as recently discovered, not guaranteed
-reachable; a kit that stops advertising disappears from discovery within 30 s.
-The computer and kits must share a network that permits multicast and device
-communication. This works with a conventional router, another ESP32 configured
-as an access point, or a Raspberry Pi hotspot; no internet connection is required.
-When multicast is blocked, use a saved/manual IP or the kit's `.local` hostname.
-
-Switching kits stops the current recording and retains it for export. HDF5 root
-attributes `device_id` and `device_name` identify its source, and the explorer
-shows the kit identity. The dashboard rejects mixing a different device ID into
-an ongoing recording. Simultaneous recording of multiple kits is not included.
-
-## Explore data
-
-**Explore recording** opens a separate browser window/tab with a snapshot of
-the current session. Both the navigation link and recording button use the same
-analysis window. **Return to live acquisition** focuses the original window
-without reloading it or opening a second disconnected dashboard. The live
-acquisition window keeps running, and analysis shows its connection/recording
-state and sample counts. **Load current dashboard recording** refreshes the
-snapshot with newly captured samples; it does not stop recording. The explorer
-can also open a saved PAL schema-v2 `.h5` file without a connected device.
-
-- Pan using the timeline slider, or enter start/window durations in seconds.
-- Zoom to individual acoustic samples or fit the session.
-- Compare audio, acceleration, gyroscope and a selected environmental channel
-  on the same time range. Hover to inspect values and timestamps.
-- Play up to 120 seconds of the visible range, stop playback, adjust playback
-  gain, or save that range as a standard PCM WAV file. Missing audio spans play
-  as silence, and each frame's sample rate determines playback timing.
-
-HDF5 imports are bounded to 192 MiB on disk and 512 MiB of estimated expanded
-numeric data. This explorer reads the schema below; earlier experimental PAL
-HDF5 files and CSV files need conversion before loading.
-
-## HDF5 schema (version 2)
-
-The root has `schema = pal-v2-timeseries`, `schema_version = 2`, recording
-start/end wall-clock milliseconds, and malformed-packet count. Numeric
-nonempty datasets use chunking and gzip level 4. Audio PCM is written in
-chunks to avoid creating another full PCM array in JavaScript.
-
-| Dataset | Type / shape | Meaning |
-| --- | --- | --- |
-| `/imu/time_ms` | float64, N | Device timestamps in ms |
-| `/imu/values` | float32, N × 6 | ax, ay, az (m/s²), gx, gy, gz (rad/s) |
-| `/environment/time_ms` | float64, N | Device timestamps in ms |
-| `/environment/values` | float32, N × 9 | temperature_c, humidity_pct, pressure_hpa, gas_ohms, iaq, voc_ppm, eco2_ppm, battery_v, battery_pct |
-| `/audio/pcm_s16` | int16, M | Concatenated received audio samples |
-| `/audio/frame_offsets` | float64, F + 1 | Sample offsets delimiting each frame |
-| `/audio/time_ms` | float64, F | Timestamp of the **first** sample of each frame |
-| `/audio/rate` | float64, F | Per-frame sample rate in Hz |
-| `/audio/monotonic_us` | float64, F | Capture timestamp relative to device boot |
-| `/audio/sample_index` | float64, F | Captured sample index, before queue drops |
-| `/audio/sequence`, `/audio/stream_id`, `/audio/segment` | float64, F | Frame number, boot ID, DMA continuity segment |
-| `/audio/dropped`, `/audio/overruns` | float64, F | Cumulative capture queue drops and DMA overflow events |
-| `/audio/dbfs`, `/audio/clock_synced` | float64, F | Frame level and RTC synchronization flag |
-| `/audio/transport`, `/audio/codec` | uint8, F | 0/1/2 = USB/BLE/Wi-Fi; 0/1 = PCM/ADPCM |
-
-`values` datasets have column and unit attributes. Missing environmental
-values use NaN. Float64 preserves integer epoch milliseconds exactly.
-
-For frame `i`, samples occupy `[frame_offsets[i], frame_offsets[i+1])` and
-sample `j` has time `time_ms[i] + 1000*j/rate[i]`. Do not assume consecutive
-frames are contiguous: consult sequence, stream ID, segment and timestamps.
-An RTC sync changes wall-clock anchoring, so the dashboard disables Sync during
-recording; device monotonic timestamps remain available for analysis.
-
-Python example (`pip install h5py`):
-
-```python
-import h5py
-with h5py.File('recording.h5') as f:
-    acceleration = f['imu/values'][:, :3]
-    imu_time_ms = f['imu/time_ms'][:]
-    offsets = f['audio/frame_offsets'][:].astype('int64')
-    i = 0
-    pcm = f['audio/pcm_s16'][offsets[i]:offsets[i + 1]]
-    rate = f['audio/rate'][i]
-    first_sample_ms = f['audio/time_ms'][i]
-```
-
-## Firmware and protocol
-
-- A high-priority capture task reads I2S DMA continuously and forms 1,600-sample
-  frames. Its bounded queue never waits for networking. Queue overflow increments
-  a counter; sequence and sample indices continue, so gaps are detectable.
-- DMA overflows start a new continuity segment. The first sample timestamp is
-  estimated from capture startup and then advanced by sample count at 16 kHz;
-  it is not a hardware RTC timestamp for every individual I2S sample.
-- UART TX buffering overlaps USB transmission with radio work; command replies
-  have a separate priority queue. BLE retries span multiple connection events.
-- A separate task handles serial, BLE notifications, and WebSockets. Sensor
-  sampling runs on the other core. IMU timestamps are host read-time estimates;
-  the FIFO runs at 104 Hz. Environment is sampled about once per second.
-- ADPCM frames have a four-byte predictor/index header. `audio_samples` is
-  authoritative: the unused high nibble of the last byte is padding.
-- USB and Wi-Fi use JSON Lines with types `audio`, `telemetry` (IMU array),
-  `environment`, `status`, and startup `microphone_diagnostics`. Audio protocol
-  version is 2. BLE uses compact binary audio/IMU packets, retaining every sample;
-  other packets are JSON within the same binary envelope. IMU axes use native
-  signed 16-bit counts for the configured ±4 g / ±500 dps ranges and are decoded
-  to m/s² and rad/s in the dashboard.
-- The BLE envelope is 12 bytes: `PAL` + byte 2, kind (0 JSON / 1 audio / 2 IMU),
-  reserved zero, uint16 payload length, uint32 IEEE CRC32 of payload; integers
-  are little-endian. Payload layouts are defined in `dashboard/ble-protocol.js`
-  and `src/main.cpp`. The parser reassembles notifications and rejects corrupt
-  frames. BLE command writes still use newline-terminated UTF-8 JSON.
-- RTC interpolation uses `esp_timer_get_time()` to avoid `millis()` rollover.
-- The BLE service UUID is `7f510001-5b8d-4a84-9c7c-a07142ab6002`; data notify
-  characteristic starts with `7f510002`, and command characteristic with `7f510003`.
-  The dashboard completes an encrypted read before sending commands. The v2
-  upgrade clears old device pairing records once; later boots preserve bonds.
-  If the OS reports “Peer removed pairing information” on that first upgrade,
-  forget only the PAL kit in the OS Bluetooth settings, then reconnect to
-  establish the new bond.
-
-Commands, each terminated with a newline:
 
 ```json
+{"cmd":"get_config"}
 {"cmd":"set_time","unix_ms":1793896772968}
 {"cmd":"wifi_on","ssid":"Example network","password":"example-password"}
 {"cmd":"wifi_status"}
 {"cmd":"wifi_off"}
 ```
 
-The command limit is 768 UTF-8 bytes. BLE partial commands expire after five
-seconds. Input validation uses a JSON parser, not substring matching.
+Commands are newline-terminated, at most 768 UTF-8 bytes. BLE fragments expire
+after 5 s. Wi-Fi association times out after 20 s; BLE stays available until a
+WebSocket connects and resumes on disconnection. Credentials live in RAM only,
+are never echoed or recorded, and are cleared from the dashboard input. A reboot
+requires provisioning again. Pairing uses encrypted Just Works; Wi-Fi is
+unauthenticated/unencrypted and intended for a trusted LAN. No automatic Wi-Fi
+reconnect is enabled; select/reprovision the kit after a failure.
 
-## Wiring
+## HDF5 schema
 
-| Signal | Feather GPIO |
-| --- | --- |
-| Microphone BCLK (A0) | 26 |
-| Microphone DOUT (A1) | 25 |
-| Microphone LRCL (A5) | 4 |
-| Microphone SEL | GND or 3.3 V; active slot is detected and held |
-| I2C SDA / SCL (board variant defaults) | 22 / 20 |
-| Battery divider | 35 |
-| NeoPixel data / power | 0 / 2 |
+The historical root schema identifier remains `pal-v2-timeseries`; A3 recordings
+use **schema_version=3**. Old schema-2 files still import. Numeric datasets are
+chunked/gzip-compressed; `configuration_json` stores the configuration.
 
-GPIO39 (A3) is input-only and cannot drive LRCL. The microphone does not need
-MCLK; its pin is explicitly disabled so I2S cannot claim NeoPixel GPIO0.
+| Dataset | Contents |
+|---|---|
+| `/audio/pcm_s32` | Unshifted int32 I2S words; decoded 16-bit BLE/legacy frames are promoted by ×65536 |
+| `/audio/frame_offsets` | Frame boundaries in the concatenated sample dataset |
+| `/audio/{time_ms,rate,monotonic_us,sample_index,sequence,stream_id,segment,dropped,overruns,dbfs,clock_synced}` | Per-frame timing, format and continuity metadata |
+| `/audio/{transport,codec}` | USB/BLE/Wi-Fi = 0/1/2; PCM16/ADPCM/raw I2S32 = 0/1/2 |
+| `/imu_raw/records` | Float64 rows: time_ms, monotonic_us, tag, x, y, z, sequence, segment, stream_id, clock_synced; signed counts remain exact |
+| `/imu/{time_ms,values}` | Converted fresh-pair preview, ax/ay/az in m/s² and gx/gy/gz in rad/s |
+| `/environment/{time_ms,values}` | Compensated T/P/H/gas; legacy derived fields remain NaN on A3 |
+| `/environment/status` | Monotonic time, new-data/gas/heater flags, measurement/profile index, clock validity |
+| `/health/records` | Battery voltage, sensor states, loss counts and heap measurements |
 
-BME688 IAQ/VOC/eCO₂ are heuristic estimates, not calibrated gas concentrations.
-Battery voltage uses the existing divider model and may need board-specific
-ADC calibration. These estimates do not change the underlying sensor streams.
+Every table has column attributes. Missing numeric values use NaN. Raw audio
+normalization for display uses 2^31; this does not imply 32 valid sensor bits.
+Frame sample `j` has estimated time `time_ms + 1000*j/rate`. Check boot IDs,
+segments, counters and validity before combining spans. Trim is never applied to
+recorded IMU samples. Legacy-only sessions may still export schema 2 with
+`/audio/pcm_s16`.
 
-## Verification
+## USB bridge and validation
+
+```sh
+python3 -m venv .venv-usb
+.venv-usb/bin/pip install -r scripts/requirements-usb.txt
+.venv-usb/bin/python scripts/usb_bridge.py --port /dev/cu.usbmodemYOUR_DEVICE
+```
+
+Choose **Connect USB bridge**. It binds to loopback, accepts the local dashboard
+origin, and supports one dashboard. It cannot fix a device that macOS does not
+enumerate. Close the bridge before flashing or running the serial check.
 
 ```sh
 npm test
 ~/.platformio/penv/bin/pio test -e native
-~/.platformio/penv/bin/pio run -e adafruit_feather_esp32_v2
-~/.platformio/penv/bin/python scripts/check_device.py --port /dev/cu.usbserial-YOUR_DEVICE --seconds 25
+~/.platformio/penv/bin/pio run -e fred_pal_a3
+~/.platformio/penv/bin/python scripts/check_device.py --port /dev/cu.usbmodemYOUR_DEVICE --seconds 25
 ```
 
-`check_device.py` reads serial packets and reports audio counts, gaps, capture
-drops and status; `--sync` also sets the RTC, and `--capture path.jsonl` saves a
-temporary protocol trace. Close the dashboard's USB connection before using it.
-If Apple's command-line compiler cannot find `<string>`, run the native test
-with `CPLUS_INCLUDE_PATH` set to your SDK's `usr/include/c++/v1` directory.
+`--sync` explicitly sets UTC; `--capture path.jsonl` saves a local trace. The
+checker drains one second of connection backlog, then checks JSON, audio payload
+lengths and sequence/sample continuity using bulk reads. It exits unsuccessfully
+on corrupt or missing audio packets. It reports health counter increases separately.
+Both Python serial tools keep DTR/RTS deasserted when opening the device.
+The bridge also drains one second of startup/backlog data and aligns to a JSON
+line before forwarding. Some hosts still reset native CDC on open despite the
+requested control-line state. Recognized initial ROM diagnostics are not
+counted as malformed dashboard packets.
+If the
+macOS native compiler cannot find `<string>`, prefix the test command with
+`CPLUS_INCLUDE_PATH=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1`.
 
-Tests cover ADPCM sample counts and buffer boundaries, malformed/fragmented
-packets, HDF5 round trips (including empty and sensor-only recordings), exact
-timestamps, mixed sample rates, missing-audio playback, WAV headers, analysis
-window reuse and snapshot isolation, multi-kit address selection, the local
-discovery API, and mDNS announcements/goodbyes over isolated loopback UDP.
+Software verification covers codec framing, exact 32-bit/HDF5 round trips, mixed
+raw/preview recordings, orientation rotations/trim/gaps, native FIFO record
+handling, discovery and recording workflows. A simulated stream exercises the
+browser render. **Electrical first-article qualification is still required:**
+flash/PSRAM detection, sensor identities/readback, 64 BCLK per WS, ≥4,096 startup
+frames, known-tone bit alignment, ADC against a meter, RTC power retention,
+FIFO health, and sustained USB/Wi-Fi throughput under power/network stress.
+Use the supplied reference's acceptance checklist; no bench performance or
+sensor-to-enclosure alignment is claimed by compilation or simulated tests.
+
+Firmware `a3-1.2.1` was flashed with all four image digests verified, followed by
+automatic application-version readback. A 10-second USB check received 501 raw
+48 kHz frames with zero gaps or counter increases. A Chrome Bluetooth recording
+at 24 kHz / 104 Hz retained 2,267 audio frames (1,088,160 samples; 45.34 seconds),
+9,200 native IMU records and 45 environmental readings. Data Explorer and the
+exported HDF5 readback both reported zero missing audio frames or capture drops;
+DMA, BLE and telemetry counters did not increase during that recording.
+The UI's 52/104 Hz IMU changes and flat-surface trim were exercised on the board;
+a separate BLE test applied 16 kHz / 26 Hz and restored 24 kHz / 104 Hz.
+All 38 JavaScript and 10 native tests passed. See the
+[a3-1.2.1 acquisition report](validation/a3-1.2.1-acquisition-2026-11-06.json).
+Live diagnostics distinguish totals since connection from counters since boot;
+the Explorer reports gaps within the recording. Pairing and sampling transitions
+can interrupt acquisition, so configure first, then start recording.
+
+On 2026-11-06, firmware `a3-1.0.1` was flashed and hash-verified on the attached
+A3. A 25-second USB check received 1,249 raw audio frames (1,199,040 samples),
+2,562 accelerometer and 2,562 gyroscope records, with zero malformed lines,
+invalid audio payloads, sequence gaps, or increases in drop/overrun counters.
+Flash/PSRAM and sensor configuration readbacks succeeded; explicit RTC sync was
+acknowledged. The dashboard's live pose and trim were exercised with the board.
+The [verification report](validation/a3-usb-smoke-2026-11-06.json) records the
+firmware SHA-256 and device responses. This smoke check does not replace the
+electrical qualification above; battery ADC readings require meter validation.
